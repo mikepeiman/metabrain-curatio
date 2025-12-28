@@ -1,0 +1,47 @@
+{
+   "action": {
+      "default_icon": {
+         "128": "img/icon128.png",
+         "16": "img/favicon.png",
+         "48": "img/icon48.png"
+      },
+      "default_title": "Tabs Outliner v3"
+   },
+   "background": {
+      "service_worker": "background_v3.js"
+   },
+   "commands": {
+      "_execute_browser_action": {
+      },
+      "save_close_all_windows": {
+         "description": "Save and Close all open windows"
+      },
+      "save_close_current_tab": {
+         "description": "Save and Close current tab"
+      },
+      "save_close_current_window": {
+         "description": "Save and Close current window"
+      }
+   },
+   "default_locale": "en",
+   "description": "The Next Generation Session Manager; A Really Working Too Many Open Tabs Solution; And Your Browsing Notebook.",
+   "key": "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDTFjLkWlVbRsd0qJrg1Wgk/T+XtMulOxKQDm4FVwjTCWbD8qpfnA8xVvGuWhQqzWHmqlRfY3IAqeVJd4/hEQr5ZpXNBa25+GAzjFT/pykj7oVPXArswhJWx/WuTUMqmIIFuoehFBNQ8bbGj6X1DZ5KwbJf7MD4JQYEr6AuK49T5wIDAQAB",
+   "manifest_version": 3,
+   "minimum_chrome_version": "91.0.0.0",
+   "name": "Tabs Outliner",
+   "oauth2": {
+      "client_id": "264571147925-gl2i51b5j91lkd21gojr9jh06kp2gos3.apps.googleusercontent.com",
+      "scopes": [ "https://www.googleapis.com/auth/drive.appdata" ]
+   },
+   "offline_enabled": true,
+   "optional_permissions": [ "identity.email", "clipboardRead", "clipboardWrite" ],
+   "options_page": "options.html",
+   "permissions": [ "storage", "tabs", "unlimitedStorage", "favicon", "identity", "system.display" ],
+   "update_url": "https://clients2.google.com/service/update2/crx",
+   "version": "1.4.153",
+   "web_accessible_resources": [ {
+      "extension_ids": [ "*" ],
+      "matches": [ "\u003Call_urls>" ],
+      "resources": [ "_favicon/*" ]
+   } ]
+}
