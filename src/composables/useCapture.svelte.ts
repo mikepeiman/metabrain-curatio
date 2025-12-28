@@ -37,6 +37,8 @@ class CaptureStore {
         if (saved) {
             this.items = saved.items;
             this.rootSessionId = saved.rootSessionId;
+            // Load activeChromeMap if present (backward compatibility: default to empty object)
+            this.activeChromeMap = saved.activeChromeMap || {};
         } else {
             // Only create default session if background script (popup shouldn't create data)
             if (this.isBackground) {
@@ -48,6 +50,7 @@ class CaptureStore {
                     data: { name: 'Default Session', windows: [] } as SavedSessionPayload
                 };
                 this.rootSessionId = sessionId;
+                this.activeChromeMap = {};
                 await this.save();
             }
         }
@@ -67,6 +70,7 @@ class CaptureStore {
                     // Update local state to match storage (popup reads updates from background)
                     this.items = newValue.items;
                     this.rootSessionId = newValue.rootSessionId;
+                    this.activeChromeMap = newValue.activeChromeMap || {};
                 }
             }
         };
@@ -221,7 +225,8 @@ class CaptureStore {
 
         await metabrainStorage.save({
             items: $state.snapshot(this.items),
-            rootSessionId: this.rootSessionId
+            rootSessionId: this.rootSessionId,
+            activeChromeMap: $state.snapshot(this.activeChromeMap)
         });
     }
 
