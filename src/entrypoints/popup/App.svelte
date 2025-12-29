@@ -18,6 +18,10 @@
     rootSession ? captureStore.getChildren(captureStore.rootSessionId) : [],
   );
 
+  function toggleShowArchived() {
+    captureStore.showArchived = !captureStore.showArchived;
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     const focusedId = captureStore.focusedNodeId;
 
@@ -97,6 +101,15 @@
         Workflowy-Style Outliner
       </p>
     </div>
+    <label
+      class="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer">
+      <input
+        type="checkbox"
+        checked={captureStore.showArchived}
+        onchange={toggleShowArchived}
+        class="w-3 h-3 rounded border-neutral-700 bg-neutral-800 text-indigo-500 focus:ring-indigo-500" />
+      <span>Show Archived</span>
+    </label>
   </header>
 
   <div class="outline-tree">

@@ -17,6 +17,7 @@
   const item = $derived(captureStore.items[id]);
   const children = $derived(item ? captureStore.getChildren(id) : []);
   const isFocused = $derived(captureStore.focusedNodeId === id);
+  const isSelected = $derived(captureStore.selectedNodeIds.has(id));
 
   const isActive = $derived.by(() => {
     if (!item) return false;
@@ -50,7 +51,7 @@
 
   function handleClick(e: MouseEvent) {
     e.stopPropagation();
-    captureStore.setFocus(id);
+    captureStore.toggleSelectNode(id, e.shiftKey, e.ctrlKey || e.metaKey);
   }
 
   let isEditingTitle = $state(false);
@@ -61,12 +62,17 @@
 
     if (item?.definitionId === DEFINITIONS.BROWSER_TAB) {
       const payload = item.data as BrowserTabPayload;
-      // If tab is open, focus it in Chrome
+      // If tab is open and active, focus it in Chrome
       if (payload.isOpen && payload.chromeId !== undefined) {
         captureStore.focusChromeTab(id);
-      } else {
-        // Otherwise toggle open/closed
-        captureStore.toggleOpen(id);
+      } else if (payload.url) {
+        // Check if tab already exists before creating
+        const existingTabId = captureStore.findTabByUrl(payload.url);
+        if (existingTabId && existingTabId !== id) {
+          captureStore.focusChromeTab(existingTabId);
+        } else {
+          captureStore.toggleOpen(id);
+        }
       }
     } else if (item?.definitionId === DEFINITIONS.BROWSER_WINDOW) {
       const payload = item.data as BrowserWindowPayload;
@@ -81,6 +87,13 @@
     } else {
       captureStore.toggleOpen(id);
     }
+  }
+
+  function handleSleepClick(e: MouseEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    // Use toggleOpen to sleep the item (will close Chrome tab/window)
+    captureStore.toggleOpen(id);
   }
 
   function handleTitleKeydown(e: KeyboardEvent) {
@@ -170,6 +183,7 @@
     `flex items-center py-0.5 text-base transition-colors outline-none select-none cursor-pointer relative
        ${isActive ? "text-neutral-100" : "text-neutral-500"} 
        ${isFocused ? "bg-indigo-500/20 border-l-2 border-indigo-500" : "border-l-2 border-transparent hover:bg-neutral-800/50"}
+       ${isSelected ? "bg-blue-500/10" : ""}
        ${isChromeFocused ? "ring-1 ring-blue-400/50" : ""}`,
   );
 
@@ -231,7 +245,7 @@
       </div>
     {/each}
 
-    <div class="flex items-center gap-2 min-w-0 flex-1 relative z-10">
+    <div class="flex items-center gap-2 min-w-0 flex-1 relative z-10 group">
       <!-- Icon Container -->
       <div class="w-4 h-4 shrink-0 flex items-center justify-center">
         {#if favIconUrl}
@@ -263,12 +277,32 @@
         <span class="truncate">{displayName}</span>
       {/if}
 
-      <!-- Ghost Label -->
-      {#if !isActive}
-        <span
-          class="text-[9px] text-neutral-600 ml-auto shrink-0 uppercase tracking-wider font-bold pr-2"
-          >Ghost</span>
-      {/if}
+      <!-- Inactive Label and Sleep Button -->
+      <div class="ml-auto shrink-0 flex items-center gap-2 pr-2">
+        {#if !isActive}
+          <span
+            class="text-[9px] text-neutral-600 uppercase tracking-wider font-bold"
+            >Inactive</span>
+        {/if}
+        {#if isActive && (item.definitionId === DEFINITIONS.BROWSER_TAB || item.definitionId === DEFINITIONS.BROWSER_WINDOW)}
+          <button
+            onclick={handleSleepClick}
+            class="w-4 h-4 flex items-center justify-center text-neutral-400 hover:text-neutral-200 transition-colors opacity-0 group-hover:opacity-100"
+            title="Sleep (deactivate)">
+            <svg
+              class="w-3 h-3"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+            </svg>
+          </button>
+        {/if}
+      </div>
     </div>
   </div>
 

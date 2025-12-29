@@ -14,8 +14,10 @@ class CaptureStore {
     activeChromeMap = $state<Record<number, UUID>>({});
     rootSessionId = $state<UUID>('');
     focusedNodeId = $state<UUID | null>(null);
+    selectedNodeIds = $state<Set<UUID>>(new Set());
+    showArchived = $state<boolean>(false);
 
-    // Map<ExpectedURL, UUID> - Used to link new Chrome tabs to existing Ghost UUIDs
+    // Map<ExpectedURL, UUID> - Used to link new Chrome tabs to existing inactive UUIDs
     private pendingRestores = new Map<string, UUID>();
 
     private isBackground = false;
@@ -61,6 +63,8 @@ class CaptureStore {
                     this.items = newValue.items;
                     this.rootSessionId = newValue.rootSessionId;
                     this.activeChromeMap = newValue.activeChromeMap || {};
+                    // Trigger reactivity
+                    this.items = { ...this.items };
                 }
             }
         };
@@ -86,13 +90,39 @@ class CaptureStore {
     }
 
     private setupListeners() {
-        chrome.windows.onCreated.addListener(w => { this.upsertWindow(w); this.save(); });
-        chrome.windows.onRemoved.addListener(id => { this.markWindowAsGhost(id); this.save(); });
+        chrome.windows.onCreated.addListener(w => {
+            this.upsertWindow(w);
+            this.save();
+            this.items = { ...this.items }; // Trigger reactivity
+        });
+        chrome.windows.onRemoved.addListener(id => {
+            this.markWindowAsGhost(id);
+            this.save();
+            this.items = { ...this.items }; // Trigger reactivity
+        });
 
-        chrome.tabs.onCreated.addListener(t => { this.upsertTab(t); this.save(); });
-        chrome.tabs.onUpdated.addListener((_, __, t) => { this.upsertTab(t); this.save(); });
-        chrome.tabs.onRemoved.addListener(id => { this.markTabAsGhost(id); this.save(); });
-        chrome.tabs.onMoved.addListener(id => chrome.tabs.get(id, t => { if (t) { this.upsertTab(t); this.save(); } }));
+        chrome.tabs.onCreated.addListener(t => {
+            this.upsertTab(t);
+            this.save();
+            this.items = { ...this.items }; // Trigger reactivity
+        });
+        chrome.tabs.onUpdated.addListener((_, __, t) => {
+            this.upsertTab(t);
+            this.save();
+            this.items = { ...this.items }; // Trigger reactivity
+        });
+        chrome.tabs.onRemoved.addListener(id => {
+            this.markTabAsGhost(id);
+            this.save();
+            this.items = { ...this.items }; // Trigger reactivity
+        });
+        chrome.tabs.onMoved.addListener(id => chrome.tabs.get(id, t => {
+            if (t) {
+                this.upsertTab(t);
+                this.save();
+                this.items = { ...this.items }; // Trigger reactivity
+            }
+        }));
     }
 
     // --- ACTIONS ---
@@ -109,7 +139,13 @@ class CaptureStore {
                 // SLEEP: Close tab, keep node
                 try { await chrome.tabs.remove(payload.chromeId); } catch (e) { /* ignore if already gone */ }
             } else if (payload.url) {
-                // WAKE: Restore tab at exact location
+                // WAKE: Check if tab already exists before creating
+                const existingTabId = this.findTabByUrl(payload.url);
+                if (existingTabId && existingTabId !== id) {
+                    // Tab already exists, focus it instead
+                    await this.focusChromeTab(existingTabId);
+                    return;
+                }
 
                 // Find parent window
                 const parentId = this.findParent(id);
@@ -120,7 +156,7 @@ class CaptureStore {
 
                 let windowChromeId = (parentItem.data as BrowserWindowPayload).chromeId;
 
-                // If Parent Window is Ghost, Wake it first
+                // If Parent Window is inactive, Wake it first
                 if (windowChromeId === undefined || !(parentItem.data as BrowserWindowPayload).isOpen) {
                     await this.toggleOpen(parentId);
                     windowChromeId = (this.items[parentId].data as BrowserWindowPayload).chromeId;
@@ -139,6 +175,8 @@ class CaptureStore {
                         index: index >= 0 ? index : undefined,
                         active: true
                     });
+                    // Trigger reactivity after tab creation
+                    this.items = { ...this.items };
                 }
             }
         }
@@ -158,8 +196,24 @@ class CaptureStore {
                 } else {
                     await chrome.windows.create({});
                 }
+                // Trigger reactivity after window creation
+                this.items = { ...this.items };
             }
         }
+        // Trigger reactivity after toggle operations
+        this.items = { ...this.items };
+    }
+
+    findTabByUrl(url: string): UUID | null {
+        for (const [id, item] of Object.entries(this.items)) {
+            if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const payload = item.data as BrowserTabPayload;
+                if (payload.url === url && payload.isOpen && payload.chromeId !== undefined) {
+                    return id;
+                }
+            }
+        }
+        return null;
     }
 
     async outdentNode(id: UUID) {
@@ -202,7 +256,9 @@ class CaptureStore {
                 (this.items[newWindowId].data as BrowserWindowPayload).isOpen = false;
             }
 
+            this.checkAndDeleteEmptyContainers(parentId);
             this.save();
+            this.setFocus(id);
             return;
         }
 
@@ -232,7 +288,9 @@ class CaptureStore {
                 pl.children.push(id);
             }
         }
+        this.checkAndDeleteEmptyContainers(parentId);
         this.save();
+        this.setFocus(id);
     }
 
     indentNode(id: UUID) {
@@ -268,7 +326,10 @@ class CaptureStore {
             tabPayload.children.push(id);
         }
 
+        this.checkAndDeleteEmptyContainers(parentId);
         this.save();
+        // Maintain focus after operation
+        this.setFocus(id);
     }
 
     // --- HELPERS (UPSERT logic restored) ---
@@ -283,8 +344,11 @@ class CaptureStore {
             const windowItem = this.items[windowId] as MetaItem<BrowserWindowPayload>;
             windowItem.data.chromeId = win.id;
             windowItem.data.isOpen = true;
+            windowItem.data.status = 'active';
             this.activeChromeMap[win.id] = windowId;
             win.tabs?.forEach((tab: chrome.tabs.Tab) => this.upsertTab(tab, windowId));
+            // Trigger reactivity
+            this.items = { ...this.items };
             return;
         }
 
@@ -354,11 +418,14 @@ class CaptureStore {
                 favIconUrl: tab.favIconUrl,
                 isPinned: tab.pinned,
                 chromeId: tab.id,
-                isOpen: true
+                isOpen: true,
+                status: 'active'
             });
             this.ensureTabInWindow(tabId, winId);
         }
         this.activeChromeMap[tab.id] = tabId;
+        // Trigger reactivity by updating state
+        this.items = { ...this.items };
     }
 
     private markTabAsGhost(chromeTabId: number) {
@@ -373,6 +440,8 @@ class CaptureStore {
             }
         }
         delete this.activeChromeMap[chromeTabId];
+        // Trigger reactivity by updating state
+        this.items = { ...this.items };
     }
 
     private markWindowAsGhost(chromeWinId: number) {
@@ -397,6 +466,8 @@ class CaptureStore {
             });
         }
         delete this.activeChromeMap[chromeWinId];
+        // Trigger reactivity by updating state
+        this.items = { ...this.items };
     }
 
     private ensureTabInWindow(tabId: UUID, windowId: UUID) {
@@ -446,15 +517,17 @@ class CaptureStore {
         const item = this.items[id];
         if (!item) return [];
 
-        // Filter out archived items
+        // Filter out archived items if not showing archived
         const filterArchived = (ids: UUID[]): UUID[] => {
             return ids.filter(childId => {
                 const child = this.items[childId];
                 if (!child) return false;
-                if (child.definitionId === DEFINITIONS.BROWSER_TAB) {
-                    return (child.data as BrowserTabPayload).status !== 'archived';
-                } else if (child.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-                    return (child.data as BrowserWindowPayload).status !== 'archived';
+                if (!this.showArchived) {
+                    if (child.definitionId === DEFINITIONS.BROWSER_TAB) {
+                        return (child.data as BrowserTabPayload).status !== 'archived';
+                    } else if (child.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                        return (child.data as BrowserWindowPayload).status !== 'archived';
+                    }
                 }
                 return true;
             });
@@ -470,6 +543,34 @@ class CaptureStore {
             return filterArchived((item.data as BrowserTabPayload).children || []);
         }
         return [];
+    }
+
+    toggleSelectNode(id: UUID, shiftKey: boolean = false, ctrlKey: boolean = false) {
+        if (shiftKey && this.focusedNodeId) {
+            // Range selection
+            const nodes = this.flatVisibleNodes;
+            const startIndex = nodes.indexOf(this.focusedNodeId);
+            const endIndex = nodes.indexOf(id);
+            if (startIndex >= 0 && endIndex >= 0) {
+                const min = Math.min(startIndex, endIndex);
+                const max = Math.max(startIndex, endIndex);
+                for (let i = min; i <= max; i++) {
+                    this.selectedNodeIds.add(nodes[i]);
+                }
+            }
+        } else if (ctrlKey) {
+            // Toggle individual selection
+            if (this.selectedNodeIds.has(id)) {
+                this.selectedNodeIds.delete(id);
+            } else {
+                this.selectedNodeIds.add(id);
+            }
+        } else {
+            // Single selection
+            this.selectedNodeIds.clear();
+            this.selectedNodeIds.add(id);
+        }
+        this.setFocus(id);
     }
 
     get flatVisibleNodes(): UUID[] {
@@ -556,6 +657,48 @@ class CaptureStore {
         // Normal swap within siblings
         [siblings[index], siblings[newIndex]] = [siblings[newIndex], siblings[index]];
         this.save();
+        // Maintain focus after operation
+        this.setFocus(id);
+    }
+
+    private checkAndDeleteEmptyContainers(containerId: UUID) {
+        const container = this.items[containerId];
+        if (!container) return;
+
+        let children: UUID[] = [];
+        if (container.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            children = (container.data as BrowserWindowPayload).tabs || [];
+        } else if (container.definitionId === DEFINITIONS.BROWSER_TAB) {
+            children = (container.data as BrowserTabPayload).children || [];
+        }
+
+        // Filter out archived children
+        const activeChildren = children.filter(childId => {
+            const child = this.items[childId];
+            if (!child) return false;
+            if (child.definitionId === DEFINITIONS.BROWSER_TAB) {
+                return (child.data as BrowserTabPayload).status !== 'archived';
+            } else if (child.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                return (child.data as BrowserWindowPayload).status !== 'archived';
+            }
+            return true;
+        });
+
+        // If container is empty, delete it
+        if (activeChildren.length === 0 && (container.definitionId === DEFINITIONS.BROWSER_WINDOW || container.definitionId === DEFINITIONS.BROWSER_TAB)) {
+            const parentId = this.findParent(containerId);
+            if (parentId) {
+                this.removeFromParent(containerId, parentId);
+                // Recursively check parent
+                this.checkAndDeleteEmptyContainers(parentId);
+            }
+            // Archive the container instead of deleting
+            if (container.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                (container.data as BrowserWindowPayload).status = 'archived';
+            } else if (container.definitionId === DEFINITIONS.BROWSER_TAB) {
+                (container.data as BrowserTabPayload).status = 'archived';
+            }
+        }
     }
 
     navigateFocus(direction: 'up' | 'down') {
