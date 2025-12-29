@@ -175,7 +175,10 @@ class CaptureStore {
                         index: index >= 0 ? index : undefined,
                         active: true
                     });
-                    // Trigger reactivity after tab creation
+                    // Update state immediately for instant UI feedback
+                    payload.isOpen = true;
+                    payload.status = 'active';
+                    // Trigger reactivity immediately
                     this.items = { ...this.items };
                 }
             }
@@ -196,7 +199,10 @@ class CaptureStore {
                 } else {
                     await chrome.windows.create({});
                 }
-                // Trigger reactivity after window creation
+                // Update state immediately for instant UI feedback
+                payload.isOpen = true;
+                payload.status = 'active';
+                // Trigger reactivity immediately
                 this.items = { ...this.items };
             }
         }
@@ -600,7 +606,19 @@ class CaptureStore {
         const parentId = this.findParent(id);
         if (!item || !parentId) return;
 
-        const siblings = this.getChildren(parentId);
+        const parent = this.items[parentId];
+        if (!parent) return;
+
+        // Get the actual children array from parent data (not filtered)
+        let siblings: UUID[] = [];
+        if (parent.definitionId === DEFINITIONS.SESSION) {
+            siblings = (parent.data as SavedSessionPayload).windows || [];
+        } else if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            siblings = (parent.data as BrowserWindowPayload).tabs || [];
+        } else if (parent.definitionId === DEFINITIONS.BROWSER_TAB) {
+            siblings = (parent.data as BrowserTabPayload).children || [];
+        }
+
         const index = siblings.indexOf(id);
         if (index < 0) return;
 
@@ -611,8 +629,20 @@ class CaptureStore {
             const grandparentId = this.findParent(parentId);
             if (!grandparentId) return; // Can't move beyond root
 
-            const grandparentSiblings = this.getChildren(grandparentId);
+            const grandparent = this.items[grandparentId];
+            if (!grandparent) return;
+
+            let grandparentSiblings: UUID[] = [];
+            if (grandparent.definitionId === DEFINITIONS.SESSION) {
+                grandparentSiblings = (grandparent.data as SavedSessionPayload).windows || [];
+            } else if (grandparent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                grandparentSiblings = (grandparent.data as BrowserWindowPayload).tabs || [];
+            } else if (grandparent.definitionId === DEFINITIONS.BROWSER_TAB) {
+                grandparentSiblings = (grandparent.data as BrowserTabPayload).children || [];
+            }
+
             const parentIndex = grandparentSiblings.indexOf(parentId);
+            if (parentIndex < 0) return;
 
             if (direction === 'up' && index === 0 && parentIndex > 0) {
                 // Move to end of previous sibling
@@ -630,7 +660,9 @@ class CaptureStore {
                         (prevParent.data as SavedSessionPayload).windows.push(id);
                     }
                 }
+                this.items = { ...this.items }; // Trigger reactivity
                 this.save();
+                this.setFocus(id);
                 return;
             } else if (direction === 'down' && index === siblings.length - 1 && parentIndex < grandparentSiblings.length - 1) {
                 // Move to start of next sibling
@@ -648,14 +680,17 @@ class CaptureStore {
                         (nextParent.data as SavedSessionPayload).windows.unshift(id);
                     }
                 }
+                this.items = { ...this.items }; // Trigger reactivity
                 this.save();
+                this.setFocus(id);
                 return;
             }
             return; // Can't move beyond boundaries
         }
 
-        // Normal swap within siblings
+        // Normal swap within siblings - modify the actual array
         [siblings[index], siblings[newIndex]] = [siblings[newIndex], siblings[index]];
+        this.items = { ...this.items }; // Trigger reactivity
         this.save();
         // Maintain focus after operation
         this.setFocus(id);

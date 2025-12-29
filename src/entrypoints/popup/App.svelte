@@ -22,6 +22,8 @@
     captureStore.showArchived = !captureStore.showArchived;
   }
 
+  let containerElement: HTMLDivElement | null = $state(null);
+
   function handleKeydown(e: KeyboardEvent) {
     const focusedId = captureStore.focusedNodeId;
 
@@ -32,6 +34,8 @@
         e.stopPropagation();
         if (focusedId) {
           captureStore.moveNode(focusedId, "up");
+          // Ensure container stays focused for next keyboard event
+          setTimeout(() => containerElement?.focus(), 0);
         }
         return;
       } else if (e.key === "ArrowDown") {
@@ -39,6 +43,7 @@
         e.stopPropagation();
         if (focusedId) {
           captureStore.moveNode(focusedId, "down");
+          setTimeout(() => containerElement?.focus(), 0);
         }
         return;
       } else if (e.key === "ArrowLeft") {
@@ -46,6 +51,7 @@
         e.stopPropagation();
         if (focusedId) {
           captureStore.outdentNode(focusedId);
+          setTimeout(() => containerElement?.focus(), 0);
         }
         return;
       } else if (e.key === "ArrowRight") {
@@ -53,6 +59,7 @@
         e.stopPropagation();
         if (focusedId) {
           captureStore.indentNode(focusedId);
+          setTimeout(() => containerElement?.focus(), 0);
         }
         return;
       }
@@ -62,17 +69,27 @@
     if (e.key === "ArrowDown") {
       e.preventDefault();
       captureStore.navigateFocus("down");
+      setTimeout(() => containerElement?.focus(), 0);
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       captureStore.navigateFocus("up");
+      setTimeout(() => containerElement?.focus(), 0);
     } else if (e.key === "Delete" || e.key === "Backspace") {
       // Delete/Archive focused item
       if (focusedId && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         captureStore.archiveNode(focusedId);
+        setTimeout(() => containerElement?.focus(), 0);
       }
     }
   }
+
+  // Ensure container is focused when component mounts
+  $effect(() => {
+    if (containerElement) {
+      containerElement.focus();
+    }
+  });
 
   // Close context menus when clicking outside
   $effect(() => {
@@ -87,6 +104,7 @@
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div
+  bind:this={containerElement}
   class="min-h-screen bg-neutral-900 text-neutral-100 p-4 font-sans selection:bg-indigo-500/30"
   onkeydown={handleKeydown}
   tabindex="0"

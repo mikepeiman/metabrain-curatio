@@ -76,14 +76,9 @@
       }
     } else if (item?.definitionId === DEFINITIONS.BROWSER_WINDOW) {
       const payload = item.data as BrowserWindowPayload;
-      // If window is open, focus it; otherwise make title editable
-      if (payload.isOpen && payload.chromeId !== undefined) {
-        captureStore.focusChromeTab(id);
-      } else {
-        // Make window title editable
-        editValue = payload.name || "";
-        isEditingTitle = true;
-      }
+      // Always make window title editable on double-click
+      editValue = payload.name || "";
+      isEditingTitle = true;
     } else {
       captureStore.toggleOpen(id);
     }
@@ -196,6 +191,8 @@
     return guides;
   });
 
+  let nodeElement: HTMLDivElement | null = $state(null);
+
   $effect(() => {
     if (isEditingTitle && item) {
       // Select all text when editing starts
@@ -228,13 +225,12 @@
 
 {#if item}
   <div
+    bind:this={nodeElement}
     class={nodeClasses}
     style={`padding-left: ${depth * 1.5}rem;`}
     onclick={handleClick}
     ondblclick={handleDoubleClick}
-    onkeydown={handleKeydown}
     oncontextmenu={handleContextMenu}
-    tabindex="0"
     role="treeitem"
     aria-selected={isFocused}>
     <!-- Indentation Guide Lines -->
