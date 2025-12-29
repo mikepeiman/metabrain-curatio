@@ -22,17 +22,9 @@
   const isFocused = $derived(captureStore.focusedNodeId === id);
   const isSelected = $derived(captureStore.selectedNodeIds.has(id));
 
-  const isActive = $derived.by(() => {
-    if (!item) return false;
-    if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
-      const payload = item.data as BrowserTabPayload;
-      return payload.isOpen === true && payload.chromeId !== undefined;
-    } else if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-      const payload = item.data as BrowserWindowPayload;
-      return payload.isOpen === true && payload.chromeId !== undefined;
-    }
-    return true;
-  });
+  const isActive = $derived(
+    item?.data.isOpen === true && item?.data.chromeId !== undefined
+  );
 
   const displayName = $derived.by(() => {
     if (!item) return "";
@@ -171,7 +163,7 @@
     <!-- Content Row -->
     <div
       class={`flex-1 flex items-center py-0.5 text-[15px] transition-colors select-none cursor-pointer min-h-7
-        ${isActive ? "text-white" : "text-neutral-300"}
+        ${isActive ? "text-white" : "text-neutral-500"}
         ${isFocused ? "bg-indigo-500/20" : "hover:bg-neutral-800/30"}
         ${isSelected ? "bg-blue-500/10" : ""}`}
       onclick={handleContentClick}
@@ -187,10 +179,10 @@
             class={`w-4 h-4 ${!isActive ? "grayscale opacity-50" : ""}`} />
         {:else if item.definitionId === DEFINITIONS.BROWSER_TAB}
           <div
-            class={`w-3 h-3 bg-neutral-600 rounded-sm ${!isActive ? "opacity-30" : ""}`}>
+            class={`w-3 h-3 bg-neutral-600 rounded-sm ${!isActive ? "grayscale opacity-50" : ""}`}>
           </div>
         {:else if item.definitionId === DEFINITIONS.BROWSER_WINDOW}
-          <span class={`text-xs ${!isActive ? "opacity-50" : ""}`}>⊞</span>
+          <span class={`text-xs ${!isActive ? "grayscale opacity-50" : ""}`}>⊞</span>
         {/if}
       </div>
 
