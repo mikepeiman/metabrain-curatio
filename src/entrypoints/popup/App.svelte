@@ -1,10 +1,9 @@
 <script lang="ts">
   import { captureStore } from "../../composables/useCapture.svelte";
+  import NodeComponent from "./Node.svelte";
   import {
     DEFINITIONS,
     type UUID,
-    type BrowserWindowPayload,
-    type BrowserTabPayload,
     type SavedSessionPayload,
   } from "../../types";
 
@@ -13,106 +12,73 @@
     captureStore.init(false).catch(console.error);
   });
 
-  const windows = $derived(
-    (
-      captureStore.items[captureStore.rootSessionId]
-        ?.data as SavedSessionPayload
-    )?.windows
-      .map((id) => captureStore.items[id])
-      .filter((item) => item?.definitionId === DEFINITIONS.BROWSER_WINDOW) ||
-      [],
+  const rootSession = $derived(captureStore.items[captureStore.rootSessionId]);
+
+  const rootChildren = $derived(
+    rootSession ? captureStore.getChildren(captureStore.rootSessionId) : [],
   );
 
-  function getTabs(windowId: UUID) {
-    const windowItem = captureStore.items[windowId];
-    if (!windowItem) return [];
-    return (
-      (windowItem.data as BrowserWindowPayload).tabs
-        .map((id) => captureStore.items[id])
-        .filter((item) => item?.definitionId === DEFINITIONS.BROWSER_TAB) || []
-    );
+  // Get all node IDs in order for keyboard navigation
+  function getAllNodeIds(parentId: UUID, result: UUID[] = []): UUID[] {
+    result.push(parentId);
+    const children = captureStore.getChildren(parentId);
+    children.forEach((childId) => getAllNodeIds(childId, result));
+    return result;
+  }
+
+  const allNodeIds = $derived.by(() => {
+    if (!captureStore.rootSessionId) return [];
+    return getAllNodeIds(captureStore.rootSessionId);
+  });
+
+  function handleKeydown(e: KeyboardEvent) {
+    const nodeIds = allNodeIds;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      const currentIndex = captureStore.focusedNodeId
+        ? nodeIds.indexOf(captureStore.focusedNodeId)
+        : -1;
+      const nextIndex = Math.min(currentIndex + 1, nodeIds.length - 1);
+      if (nextIndex >= 0 && nodeIds[nextIndex]) {
+        captureStore.setFocus(nodeIds[nextIndex]);
+      }
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const currentIndex = captureStore.focusedNodeId
+        ? nodeIds.indexOf(captureStore.focusedNodeId)
+        : -1;
+      const prevIndex = Math.max(currentIndex - 1, 0);
+      if (prevIndex >= 0 && nodeIds[prevIndex]) {
+        captureStore.setFocus(nodeIds[prevIndex]);
+      }
+    }
   }
 </script>
 
-<main
-  class="min-h-screen bg-neutral-900 text-neutral-100 p-3 font-sans selection:bg-indigo-500/30">
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<div
+  class="min-h-screen bg-neutral-900 text-neutral-100 p-4 font-sans selection:bg-indigo-500/30"
+  onkeydown={handleKeydown}
+  tabindex="0"
+  role="application">
   <header
-    class="mb-5 border-b border-neutral-800 pb-3 flex justify-between items-end">
+    class="mb-4 border-b border-neutral-800 pb-3 flex justify-between items-end">
     <div>
       <h1 class="text-xl font-bold tracking-tight text-white">
-        Metabrain Debug
+        Metabrain Curatio
       </h1>
       <p class="text-[10px] text-neutral-500 font-mono mt-0.5">
-        ID: {captureStore.rootSessionId}
+        Workflowy-Style Outliner
       </p>
-    </div>
-    <div
-      class="text-[10px] text-neutral-500 bg-neutral-800 px-2 py-1 rounded border border-neutral-700">
-      v0.1.0-alpha
     </div>
   </header>
 
-  <div class="space-y-4">
-    {#each windows as windowItem (windowItem.id)}
-      <section
-        class="bg-neutral-800/40 border border-neutral-700/50 rounded overflow-hidden shadow-lg">
-        <div
-          class="px-3 py-1.5 bg-neutral-800/80 border-b border-neutral-700/50 flex items-center justify-between">
-          <h2
-            class="text-[10px] font-bold text-neutral-400 uppercase tracking-widest flex items-center gap-2">
-            <span
-              class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"
-            ></span>
-            {(windowItem.data as BrowserWindowPayload).name}
-          </h2>
-          <span class="text-[9px] text-neutral-600 font-mono tabular-nums"
-            >{windowItem.id}</span>
-        </div>
-
-        <ul class="divide-y divide-neutral-700/20">
-          {#each getTabs(windowItem.id) as tabItem (tabItem.id)}
-            {@const payload = tabItem.data as BrowserTabPayload}
-            <li class="px-3 py-2.5 hover:bg-white/5 transition-colors group">
-              <div class="flex items-start gap-2.5">
-                {#if payload.favIconUrl}
-                  <img
-                    src={payload.favIconUrl}
-                    alt=""
-                    class="w-3.5 h-3.5 mt-0.5 flex-shrink-0 grayscale group-hover:grayscale-0 transition-all opacity-70 group-hover:opacity-100" />
-                {:else}
-                  <div
-                    class="w-3.5 h-3.5 mt-0.5 bg-neutral-700 rounded-sm flex-shrink-0 opacity-50">
-                  </div>
-                {/if}
-
-                <div class="min-w-0 flex-1">
-                  <div
-                    class="text-xs font-medium truncate text-neutral-300 group-hover:text-white transition-colors leading-normal">
-                    {payload.title || "Untitled Tab"}
-                  </div>
-                  <div
-                    class="text-[10px] text-neutral-500 truncate mt-0.5 group-hover:text-indigo-400/80 transition-colors">
-                    {payload.url}
-                  </div>
-                  <div
-                    class="text-[8px] text-neutral-700 font-mono mt-1 opacity-0 group-hover:opacity-100 transition-opacity flex justify-between">
-                    <span>UUID: {tabItem.id}</span>
-                    <span class="text-neutral-800"
-                      >Captured: {new Date(
-                        tabItem.createdAt,
-                      ).toLocaleTimeString()}</span>
-                  </div>
-                </div>
-              </div>
-            </li>
-          {:else}
-            <li
-              class="px-3 py-6 text-center text-neutral-600 italic text-[11px]">
-              No active tabs in this window
-            </li>
-          {/each}
-        </ul>
-      </section>
+  <div class="outline-tree">
+    {#if rootSession}
+      {#each rootChildren as childId (childId)}
+        <NodeComponent id={childId} depth={0} />
+      {/each}
     {:else}
       <div
         class="flex flex-col items-center justify-center py-16 text-neutral-600">
@@ -125,17 +91,9 @@
           Wait for the background script to sync...
         </p>
       </div>
-    {/each}
+    {/if}
   </div>
-
-  <footer class="mt-8 pt-4 border-t border-neutral-800 text-center">
-    <button
-      class="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors uppercase tracking-widest font-bold"
-      onclick={() => chrome.runtime.reload()}>
-      Restart Extension
-    </button>
-  </footer>
-</main>
+</div>
 
 <style>
   :global(body) {

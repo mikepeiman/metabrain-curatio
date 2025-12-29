@@ -13,19 +13,19 @@ class CaptureStore {
     items = $state<Record<UUID, MetaItem<AnyPayload>>>({});
     activeChromeMap = $state<Record<number, UUID>>({});
     rootSessionId = $state<UUID>('');
+    focusedNodeId = $state<UUID | null>(null);
+
+    // Map<ExpectedURL, UUID> - Used to link new Chrome tabs to existing Ghost UUIDs
+    private pendingRestores = new Map<string, UUID>();
+
     private isBackground = false;
     private storageListener: ((changes: { [key: string]: chrome.storage.StorageChange }, areaName: string) => void) | null = null;
 
     async init(isBackground: boolean = false) {
         this.isBackground = isBackground;
-
-        // Auto-hydrate: Read from storage immediately
         await this.hydrateFromStorage();
-
-        // Setup storage change listener for live sync (always, for both background and popup)
         this.setupStorageListener();
 
-        // Only background script syncs with Chrome and sets up window/tab listeners
         if (isBackground) {
             await this.syncWithChrome();
             this.setupListeners();
@@ -37,186 +37,229 @@ class CaptureStore {
         if (saved) {
             this.items = saved.items;
             this.rootSessionId = saved.rootSessionId;
-            // Load activeChromeMap if present (backward compatibility: default to empty object)
             this.activeChromeMap = saved.activeChromeMap || {};
-        } else {
-            // Only create default session if background script (popup shouldn't create data)
-            if (this.isBackground) {
-                const sessionId = crypto.randomUUID();
-                this.items[sessionId] = {
-                    id: sessionId,
-                    definitionId: DEFINITIONS.SESSION,
-                    createdAt: Date.now(),
-                    data: { name: 'Default Session', windows: [] } as SavedSessionPayload
-                };
-                this.rootSessionId = sessionId;
-                this.activeChromeMap = {};
-                await this.save();
-            }
+        } else if (this.isBackground) {
+            const sessionId = crypto.randomUUID();
+            this.items[sessionId] = {
+                id: sessionId,
+                definitionId: DEFINITIONS.SESSION,
+                createdAt: Date.now(),
+                data: { name: 'Default Session', windows: [] } as SavedSessionPayload
+            };
+            this.rootSessionId = sessionId;
+            this.activeChromeMap = {};
+            await this.save();
         }
     }
 
     private setupStorageListener() {
-        // Remove existing listener if any
-        if (this.storageListener) {
-            chrome.storage.onChanged.removeListener(this.storageListener);
-        }
-
-        // Create new listener for live sync
+        if (this.storageListener) chrome.storage.onChanged.removeListener(this.storageListener);
         this.storageListener = (changes, areaName) => {
             if (areaName === 'local' && changes['local:metabrain_data']) {
                 const newValue = changes['local:metabrain_data'].newValue as MetabrainData | undefined;
                 if (newValue) {
-                    // Update local state to match storage (popup reads updates from background)
                     this.items = newValue.items;
                     this.rootSessionId = newValue.rootSessionId;
                     this.activeChromeMap = newValue.activeChromeMap || {};
                 }
             }
         };
-
         chrome.storage.onChanged.addListener(this.storageListener);
     }
 
     private async syncWithChrome() {
         const windows = await chrome.windows.getAll({ populate: true });
-        const currentWindowIds = new Set(windows.map(win => win.id).filter((id): id is number => id !== undefined));
-        const currentTabIds = new Set<number>();
+        const currentWindowIds = new Set(windows.map(w => w.id).filter((id): id is number => id !== undefined));
 
-        // Collect all current tab IDs
-        windows.forEach(win => {
-            win.tabs?.forEach(tab => {
-                if (tab.id !== undefined) {
-                    currentTabIds.add(tab.id);
-                }
-            });
-        });
-
-        // Mark items as ghost if they have a chromeId but are no longer in Chrome
+        // Ghost check
         Object.values(this.items).forEach(item => {
             if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
                 const payload = item.data as BrowserWindowPayload;
-                const chromeId = payload.chromeId;
-                if (chromeId !== undefined && payload.isOpen && !currentWindowIds.has(chromeId)) {
-                    // Window was closed, mark as ghost
-                    payload.chromeId = undefined;
-                    payload.isOpen = false;
-                    // Also mark child tabs as ghost
-                    payload.tabs.forEach(tabId => {
-                        const tabItem = this.items[tabId] as MetaItem<BrowserTabPayload> | undefined;
-                        if (tabItem) {
-                            tabItem.data.chromeId = undefined;
-                            tabItem.data.isOpen = false;
-                        }
-                    });
-                    // Remove from activeChromeMap
-                    delete this.activeChromeMap[chromeId];
-                }
-            } else if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
-                const payload = item.data as BrowserTabPayload;
-                const chromeId = payload.chromeId;
-                if (chromeId !== undefined && payload.isOpen && !currentTabIds.has(chromeId)) {
-                    // Tab was closed, mark as ghost
-                    payload.chromeId = undefined;
-                    payload.isOpen = false;
-                    // Remove from activeChromeMap
-                    delete this.activeChromeMap[chromeId];
+                if (payload.chromeId !== undefined && payload.isOpen && !currentWindowIds.has(payload.chromeId)) {
+                    this.markWindowAsGhost(payload.chromeId);
                 }
             }
         });
 
-        // Process all current Chrome windows - upsertWindow will handle deduplication
-        // and will reactivate ghost windows/tabs if they're reopened
         windows.forEach(win => this.upsertWindow(win));
-
         await this.save();
     }
 
     private setupListeners() {
-        chrome.windows.onCreated.addListener((win: chrome.windows.Window) => {
-            this.upsertWindow(win);
-            this.save();
-        });
+        chrome.windows.onCreated.addListener(w => { this.upsertWindow(w); this.save(); });
+        chrome.windows.onRemoved.addListener(id => { this.markWindowAsGhost(id); this.save(); });
 
-        chrome.windows.onRemoved.addListener((windowId: number) => {
-            this.markWindowAsGhost(windowId);
-            this.save();
-        });
-
-        chrome.tabs.onCreated.addListener((tab: chrome.tabs.Tab) => {
-            this.upsertTab(tab);
-            this.save();
-        });
-
-        chrome.tabs.onUpdated.addListener((_tabId: number, _changeInfo: any, tab: chrome.tabs.Tab) => {
-            this.upsertTab(tab);
-            this.save();
-        });
-
-        chrome.tabs.onRemoved.addListener((tabId: number) => {
-            this.markTabAsGhost(tabId);
-            this.save();
-        });
-
-        chrome.tabs.onMoved.addListener((tabId: number) => {
-            chrome.tabs.get(tabId, (tab: chrome.tabs.Tab) => {
-                if (tab) {
-                    this.upsertTab(tab);
-                    this.save();
-                }
-            });
-        });
+        chrome.tabs.onCreated.addListener(t => { this.upsertTab(t); this.save(); });
+        chrome.tabs.onUpdated.addListener((_, __, t) => { this.upsertTab(t); this.save(); });
+        chrome.tabs.onRemoved.addListener(id => { this.markTabAsGhost(id); this.save(); });
+        chrome.tabs.onMoved.addListener(id => chrome.tabs.get(id, t => { if (t) { this.upsertTab(t); this.save(); } }));
     }
 
-    private markWindowAsGhost(chromeWindowId: number) {
-        const windowId = this.activeChromeMap[chromeWindowId];
-        if (!windowId) return;
+    // --- ACTIONS ---
 
-        const windowItem = this.items[windowId] as MetaItem<BrowserWindowPayload> | undefined;
-        if (windowItem) {
-            // Soft deletion: Mark as ghost, keep all data
-            windowItem.data.chromeId = undefined;
-            windowItem.data.isOpen = false;
+    async toggleOpen(id: UUID) {
+        const item = this.items[id];
+        if (!item) return;
 
-            // Mark all child tabs as ghost too
-            const windowPayload = windowItem.data;
-            windowPayload.tabs.forEach(tabId => {
-                const tabItem = this.items[tabId] as MetaItem<BrowserTabPayload> | undefined;
-                if (tabItem) {
-                    tabItem.data.chromeId = undefined;
-                    tabItem.data.isOpen = false;
+        // 1. Handle Tab Toggle
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+            const payload = item.data as BrowserTabPayload;
+
+            if (payload.isOpen && payload.chromeId !== undefined) {
+                // SLEEP: Close tab, keep node
+                try { await chrome.tabs.remove(payload.chromeId); } catch (e) { /* ignore if already gone */ }
+            } else if (payload.url) {
+                // WAKE: Restore tab at exact location
+
+                // Find parent window
+                const parentId = this.findParent(id);
+                if (!parentId) return;
+
+                const parentItem = this.items[parentId];
+                if (!parentItem || parentItem.definitionId !== DEFINITIONS.BROWSER_WINDOW) return;
+
+                let windowChromeId = (parentItem.data as BrowserWindowPayload).chromeId;
+
+                // If Parent Window is Ghost, Wake it first
+                if (windowChromeId === undefined || !(parentItem.data as BrowserWindowPayload).isOpen) {
+                    await this.toggleOpen(parentId);
+                    windowChromeId = (this.items[parentId].data as BrowserWindowPayload).chromeId;
                 }
-            });
+
+                if (windowChromeId !== undefined) {
+                    // Calculate Index
+                    const siblings = (parentItem.data as BrowserWindowPayload).tabs;
+                    const index = siblings.indexOf(id);
+
+                    this.pendingRestores.set(payload.url, id);
+
+                    await chrome.tabs.create({
+                        windowId: windowChromeId,
+                        url: payload.url,
+                        index: index >= 0 ? index : undefined,
+                        active: true
+                    });
+                }
+            }
+        }
+        // 2. Handle Window Toggle
+        else if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            const payload = item.data as BrowserWindowPayload;
+            if (payload.isOpen && payload.chromeId !== undefined) {
+                try { await chrome.windows.remove(payload.chromeId); } catch (e) { }
+            } else {
+                // Wake Window
+                const urls = payload.tabs
+                    .map(tId => (this.items[tId]?.data as BrowserTabPayload)?.url)
+                    .filter((u): u is string => !!u);
+
+                if (urls.length > 0) {
+                    await chrome.windows.create({ url: urls });
+                } else {
+                    await chrome.windows.create({});
+                }
+            }
+        }
+    }
+
+    async outdentNode(id: UUID) {
+        const item = this.items[id];
+        const parentId = this.findParent(id);
+        if (!item || !parentId) return;
+
+        // Special Case: Detach Tab into New Window
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB && this.items[parentId]?.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+
+            this.removeFromParent(id, parentId);
+
+            const newWindowId = crypto.randomUUID();
+            this.items[newWindowId] = {
+                id: newWindowId,
+                definitionId: DEFINITIONS.BROWSER_WINDOW,
+                createdAt: Date.now(),
+                data: {
+                    name: 'New Window',
+                    tabs: [id],
+                    isOpen: true,
+                    chromeId: undefined
+                } as BrowserWindowPayload
+            };
+
+            const session = this.items[this.rootSessionId]?.data as SavedSessionPayload;
+            const parentIndex = session.windows.indexOf(parentId);
+            if (parentIndex >= 0) session.windows.splice(parentIndex + 1, 0, newWindowId);
+            else session.windows.push(newWindowId);
+
+            // Physical Update: Move the Tab in Chrome
+            const tabPayload = item.data as BrowserTabPayload;
+            if (tabPayload.isOpen && tabPayload.chromeId !== undefined) {
+                const newWin = await chrome.windows.create({ tabId: tabPayload.chromeId });
+                if (newWin && newWin.id) {
+                    (this.items[newWindowId].data as BrowserWindowPayload).chromeId = newWin.id;
+                    this.activeChromeMap[newWin.id] = newWindowId;
+                }
+            } else {
+                (this.items[newWindowId].data as BrowserWindowPayload).isOpen = false;
+            }
+
+            this.save();
+            return;
         }
 
-        // Remove from activeChromeMap
-        delete this.activeChromeMap[chromeWindowId];
+        const grandparentId = this.findParent(parentId);
+        if (!grandparentId) return;
+        this.removeFromParent(id, parentId);
+        const gp = this.items[grandparentId];
+
+        if (gp.definitionId === DEFINITIONS.SESSION) {
+            const pl = gp.data as SavedSessionPayload;
+            const idx = pl.windows.indexOf(parentId);
+            pl.windows.splice(idx + 1, 0, id);
+        } else if (gp.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            const pl = gp.data as BrowserWindowPayload;
+            const idx = pl.tabs.indexOf(parentId);
+            pl.tabs.splice(idx + 1, 0, id);
+        }
+        this.save();
     }
 
-    private markTabAsGhost(chromeTabId: number) {
-        const tabId = this.activeChromeMap[chromeTabId];
-        if (!tabId) return;
+    indentNode(id: UUID) {
+        const item = this.items[id];
+        const parentId = this.findParent(id);
+        if (!item || !parentId) return;
 
-        const tabItem = this.items[tabId] as MetaItem<BrowserTabPayload> | undefined;
-        if (tabItem) {
-            // Soft deletion: Mark as ghost, keep all data (url, title, favIconUrl)
-            tabItem.data.chromeId = undefined;
-            tabItem.data.isOpen = false;
+        const siblings = this.getChildren(parentId);
+        const index = siblings.indexOf(id);
+        if (index <= 0) return;
+
+        const prevSiblingId = siblings[index - 1];
+        const prevSibling = this.items[prevSiblingId];
+
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB && prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
+            console.warn("Grouping tabs not yet implemented");
+            return;
         }
 
-        // Remove from activeChromeMap
-        delete this.activeChromeMap[chromeTabId];
+        this.removeFromParent(id, parentId);
+
+        if (prevSibling.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            (prevSibling.data as BrowserWindowPayload).tabs.push(id);
+        } else if (prevSibling.definitionId === DEFINITIONS.SESSION) {
+            (prevSibling.data as SavedSessionPayload).windows.push(id);
+        }
+
+        this.save();
     }
+
+    // --- HELPERS (UPSERT logic restored) ---
 
     private upsertWindow(win: chrome.windows.Window) {
         if (win.id === undefined) return;
 
-        // Check if window already has a mapped UUID in activeChromeMap
         let windowId = this.activeChromeMap[win.id];
 
-        // If mapped UUID exists, verify the MetaItem exists (robustness check)
         if (windowId && this.items[windowId]) {
-            // Window already exists, reactivate it (was ghost, now active again)
+            // Reactivate existing
             const windowItem = this.items[windowId] as MetaItem<BrowserWindowPayload>;
             windowItem.data.chromeId = win.id;
             windowItem.data.isOpen = true;
@@ -225,7 +268,7 @@ class CaptureStore {
             return;
         }
 
-        // Create new window MetaItem
+        // Create new
         windowId = crypto.randomUUID();
         this.items[windowId] = {
             id: windowId,
@@ -239,7 +282,6 @@ class CaptureStore {
             } as BrowserWindowPayload
         };
 
-        // Add to session's windows array only if not already present
         const session = this.items[this.rootSessionId]?.data as SavedSessionPayload;
         if (session && !session.windows.includes(windowId)) {
             session.windows.push(windowId);
@@ -250,12 +292,20 @@ class CaptureStore {
     }
 
     private upsertTab(tab: chrome.tabs.Tab, parentWindowId?: UUID) {
-        if (tab.id === undefined) return;
+        if (!tab.id) return;
+
+        let existingUUID: UUID | undefined;
+        if (tab.url && this.pendingRestores.has(tab.url)) {
+            existingUUID = this.pendingRestores.get(tab.url);
+            this.pendingRestores.delete(tab.url);
+        }
 
         const winId = parentWindowId || this.activeChromeMap[tab.windowId];
         if (!winId) return;
 
-        let tabId = this.activeChromeMap[tab.id];
+        let tabId = existingUUID || this.activeChromeMap[tab.id];
+        if (!tabId && existingUUID) tabId = existingUUID;
+
         let tabItem = tabId ? (this.items[tabId] as MetaItem<BrowserTabPayload>) : undefined;
 
         if (!tabItem) {
@@ -265,8 +315,8 @@ class CaptureStore {
                 definitionId: DEFINITIONS.BROWSER_TAB,
                 createdAt: Date.now(),
                 data: {
-                    url: tab.url,
-                    title: tab.title,
+                    url: tab.url || '',
+                    title: tab.title || 'Untitled',
                     favIconUrl: tab.favIconUrl,
                     isPinned: tab.pinned,
                     chromeId: tab.id,
@@ -274,10 +324,8 @@ class CaptureStore {
                 }
             };
             this.items[tabId] = tabItem;
-            const windowPayload = this.items[winId].data as BrowserWindowPayload;
-            if (!windowPayload.tabs.includes(tabId)) windowPayload.tabs.push(tabId);
+            (this.items[winId].data as BrowserWindowPayload).tabs.push(tabId);
         } else {
-            // Tab exists (possibly was ghost), reactivate it
             Object.assign(tabItem.data, {
                 url: tab.url,
                 title: tab.title,
@@ -288,70 +336,92 @@ class CaptureStore {
             });
             this.ensureTabInWindow(tabId, winId);
         }
-
         this.activeChromeMap[tab.id] = tabId;
     }
 
-    private ensureTabInWindow(tabId: UUID, windowId: UUID) {
-        Object.values(this.items)
-            .filter(item => item.definitionId === DEFINITIONS.BROWSER_WINDOW && item.id !== windowId)
-            .forEach(item => {
-                const payload = item.data as BrowserWindowPayload;
-                payload.tabs = payload.tabs.filter(id => id !== tabId);
-            });
+    private markTabAsGhost(chromeTabId: number) {
+        const tabId = this.activeChromeMap[chromeTabId];
+        if (!tabId) return;
+        const tabItem = this.items[tabId] as MetaItem<BrowserTabPayload>;
+        if (tabItem) {
+            tabItem.data.chromeId = undefined;
+            tabItem.data.isOpen = false;
+        }
+        delete this.activeChromeMap[chromeTabId];
+    }
 
-        const windowPayload = this.items[windowId].data as BrowserWindowPayload;
-        if (!windowPayload.tabs.includes(tabId)) windowPayload.tabs.push(tabId);
+    private markWindowAsGhost(chromeWinId: number) {
+        const winId = this.activeChromeMap[chromeWinId];
+        if (!winId) return;
+        const winItem = this.items[winId] as MetaItem<BrowserWindowPayload>;
+        if (winItem) {
+            winItem.data.chromeId = undefined;
+            winItem.data.isOpen = false;
+            winItem.data.tabs.forEach(tId => {
+                const t = this.items[tId] as MetaItem<BrowserTabPayload>;
+                if (t) { t.data.chromeId = undefined; t.data.isOpen = false; }
+            });
+        }
+        delete this.activeChromeMap[chromeWinId];
+    }
+
+    private ensureTabInWindow(tabId: UUID, windowId: UUID) {
+        Object.values(this.items).forEach(item => {
+            if (item.definitionId === DEFINITIONS.BROWSER_WINDOW && item.id !== windowId) {
+                const pl = item.data as BrowserWindowPayload;
+                pl.tabs = pl.tabs.filter(id => id !== tabId);
+            }
+        });
+        const pl = this.items[windowId].data as BrowserWindowPayload;
+        if (!pl.tabs.includes(tabId)) pl.tabs.push(tabId);
+    }
+
+    private findParent(childId: UUID): UUID | null {
+        for (const [id, item] of Object.entries(this.items)) {
+            const children = this.getChildren(id);
+            if (children.includes(childId)) return id;
+        }
+        return null;
+    }
+
+    private removeFromParent(childId: UUID, parentId: UUID) {
+        const parent = this.items[parentId];
+        if (parent) {
+            if (parent.definitionId === DEFINITIONS.SESSION) {
+                const pl = parent.data as SavedSessionPayload;
+                pl.windows = pl.windows.filter(id => id !== childId);
+            } else if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                const pl = parent.data as BrowserWindowPayload;
+                pl.tabs = pl.tabs.filter(id => id !== childId);
+            }
+        }
+    }
+
+    getChildren(id: UUID): UUID[] {
+        const item = this.items[id];
+        if (!item) return [];
+        if (item.definitionId === DEFINITIONS.SESSION) return (item.data as SavedSessionPayload).windows || [];
+        if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) return (item.data as BrowserWindowPayload).tabs || [];
+        return [];
+    }
+
+    setFocus(id: UUID | null) { this.focusedNodeId = id; }
+
+    async clearStorage() {
+        if (this.storageListener) chrome.storage.onChanged.removeListener(this.storageListener);
+        await metabrainStorage.clear();
+        this.items = {};
+        this.activeChromeMap = {};
+        this.rootSessionId = '';
+        if (this.isBackground) await this.init(true);
     }
 
     private async save() {
-        // Guard: Only background script writes to storage
-        if (!this.isBackground) {
-            console.warn('[CaptureStore] Popup attempted to write to storage. Only background script can write.');
-            return;
-        }
-
         await metabrainStorage.save({
             items: $state.snapshot(this.items),
             rootSessionId: this.rootSessionId,
             activeChromeMap: $state.snapshot(this.activeChromeMap)
         });
-    }
-
-    get visibleItems() {
-        // Returns all items (Active + Ghost) for search/filtering
-        return Object.values(this.items);
-    }
-
-    async clearStorage() {
-        // Remove storage listener before clearing
-        if (this.storageListener) {
-            chrome.storage.onChanged.removeListener(this.storageListener);
-            this.storageListener = null;
-        }
-
-        // Clear chrome.storage.local
-        await metabrainStorage.clear();
-
-        // Reset state to empty
-        this.items = {};
-        this.activeChromeMap = {};
-        this.rootSessionId = '';
-
-        // If background script, create fresh session
-        if (this.isBackground) {
-            const sessionId = crypto.randomUUID();
-            this.items[sessionId] = {
-                id: sessionId,
-                definitionId: DEFINITIONS.SESSION,
-                createdAt: Date.now(),
-                data: { name: 'Default Session', windows: [] } as SavedSessionPayload
-            };
-            this.rootSessionId = sessionId;
-            await this.save();
-            // Re-setup storage listener
-            this.setupStorageListener();
-        }
     }
 }
 
