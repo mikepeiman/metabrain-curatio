@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dndzone } from "svelte-dnd-action";
   import { captureStore } from "../../composables/useCapture.svelte";
   import NodeComponent from "./Node.svelte";
   import {
@@ -7,13 +8,11 @@
     type SavedSessionPayload,
   } from "../../types";
 
-  // Initialize store on mount (popup is read-only)
   $effect(() => {
     captureStore.init(false).catch(console.error);
   });
 
   const rootSession = $derived(captureStore.items[captureStore.rootSessionId]);
-
   const rootChildren = $derived(
     rootSession ? captureStore.getChildren(captureStore.rootSessionId) : [],
   );
@@ -27,14 +26,12 @@
   function handleKeydown(e: KeyboardEvent) {
     const focusedId = captureStore.focusedNodeId;
 
-    // Handle Ctrl/Cmd + Arrow keys for structure manipulation
     if (e.ctrlKey || e.metaKey) {
       if (e.key === "ArrowUp") {
         e.preventDefault();
         e.stopPropagation();
         if (focusedId) {
           captureStore.moveNode(focusedId, "up");
-          // Ensure container stays focused for next keyboard event
           setTimeout(() => containerElement?.focus(), 0);
         }
         return;
@@ -65,7 +62,6 @@
       }
     }
 
-    // Handle plain Arrow keys for focus navigation
     if (e.key === "ArrowDown") {
       e.preventDefault();
       captureStore.navigateFocus("down");
@@ -75,7 +71,6 @@
       captureStore.navigateFocus("up");
       setTimeout(() => containerElement?.focus(), 0);
     } else if (e.key === "Delete" || e.key === "Backspace") {
-      // Delete/Archive focused item
       if (focusedId && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         captureStore.archiveNode(focusedId);
@@ -84,20 +79,25 @@
     }
   }
 
-  // Ensure container is focused when component mounts
+  // Transform UUIDs to objects with id property for dndzone
+  const rootDndItems = $derived(
+    rootChildren.map((childId) => ({ id: childId })),
+  );
+
+  function handleRootConsider(e: CustomEvent) {
+    // Optional: Visual feedback
+  }
+
+  function handleRootFinalize(e: CustomEvent) {
+    if (e.detail.items && rootSession) {
+      captureStore.handleSort("ROOT", e.detail.items);
+    }
+  }
+
   $effect(() => {
     if (containerElement) {
       containerElement.focus();
     }
-  });
-
-  // Close context menus when clicking outside
-  $effect(() => {
-    function handleClickOutside() {
-      // Context menus will handle their own closing
-    }
-    document.addEventListener("click", handleClickOutside);
-    return () => document.removeEventListener("click", handleClickOutside);
   });
 </script>
 
@@ -109,31 +109,32 @@
   onkeydown={handleKeydown}
   tabindex="0"
   role="application">
-  <header
-    class="mb-4 border-b border-neutral-800 pb-3 flex justify-between items-end">
-    <div>
-      <h1 class="text-xl font-bold tracking-tight text-white">
-        Metabrain Curatio
-      </h1>
-      <p class="text-[10px] text-neutral-500 font-mono mt-0.5">
-        Workflowy-Style Outliner
-      </p>
-    </div>
+  <!-- Minimal Header -->
+  <div class="mb-3 flex items-center justify-between">
+    <h1 class="text-lg font-semibold text-white">Curatio</h1>
     <label
-      class="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer">
+      class="flex items-center gap-1.5 text-xs text-neutral-400 cursor-pointer">
       <input
         type="checkbox"
         checked={captureStore.showArchived}
         onchange={toggleShowArchived}
         class="w-3 h-3 rounded border-neutral-700 bg-neutral-800 text-indigo-500 focus:ring-indigo-500" />
-      <span>Show Archived</span>
+      <span>Archived</span>
     </label>
-  </header>
+  </div>
 
-  <div class="outline-tree">
+  <!-- Root List with DnD -->
+  <div
+    class="min-h-5"
+    use:dndzone={{ items: rootDndItems, type: "default" }}
+    onconsider={handleRootConsider}
+    onfinalize={handleRootFinalize}>
     {#if rootSession}
-      {#each rootChildren as childId (childId)}
-        <NodeComponent id={childId} depth={0} />
+      {#each rootDndItems as dndItem (dndItem.id)}
+        <NodeComponent
+          id={dndItem.id}
+          depth={0}
+          items={captureStore.getChildren(dndItem.id)} />
       {/each}
     {:else}
       <div
@@ -156,7 +157,6 @@
     background-color: #0a0a0a;
   }
 
-  /* Custom scrollbar for a cleaner dark look */
   ::-webkit-scrollbar {
     width: 6px;
   }

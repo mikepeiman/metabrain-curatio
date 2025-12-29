@@ -137,7 +137,16 @@ class CaptureStore {
 
             if (payload.isOpen && payload.chromeId !== undefined) {
                 // SLEEP: Close tab, keep node
-                try { await chrome.tabs.remove(payload.chromeId); } catch (e) { /* ignore if already gone */ }
+                const chromeTabId = payload.chromeId;
+                try {
+                    await chrome.tabs.remove(chromeTabId);
+                } catch (e) { /* ignore if already gone */ }
+                // Mark as ghost immediately
+                payload.isOpen = false;
+                payload.chromeId = undefined;
+                payload.status = 'closed';
+                delete this.activeChromeMap[chromeTabId];
+                this.items = { ...this.items };
             } else if (payload.url) {
                 // WAKE: Check if tab already exists before creating
                 const existingTabId = this.findTabByUrl(payload.url);
@@ -222,6 +231,19 @@ class CaptureStore {
         return null;
     }
 
+    findTabByUrlIncludingInactive(url: string): UUID | null {
+        // Find any tab with this URL, even if inactive
+        for (const [id, item] of Object.entries(this.items)) {
+            if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const payload = item.data as BrowserTabPayload;
+                if (payload.url === url) {
+                    return id;
+                }
+            }
+        }
+        return null;
+    }
+
     async outdentNode(id: UUID) {
         const item = this.items[id];
         const parentId = this.findParent(id);
@@ -270,6 +292,12 @@ class CaptureStore {
 
         const grandparentId = this.findParent(parentId);
         if (!grandparentId) return;
+
+        // Get old parent window chromeId for tab moves
+        const oldParentWindowId = this.items[parentId]?.definitionId === DEFINITIONS.BROWSER_WINDOW
+            ? (this.items[parentId].data as BrowserWindowPayload).chromeId
+            : undefined;
+
         this.removeFromParent(id, parentId);
         const gp = this.items[grandparentId];
 
@@ -281,6 +309,18 @@ class CaptureStore {
             const pl = gp.data as BrowserWindowPayload;
             const idx = pl.tabs.indexOf(parentId);
             pl.tabs.splice(idx + 1, 0, id);
+
+            // Move Chrome tab to new position in window
+            if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const tabPayload = item.data as BrowserTabPayload;
+                const newWindowChromeId = pl.chromeId;
+                if (tabPayload.chromeId !== undefined && newWindowChromeId !== undefined) {
+                    chrome.tabs.move(tabPayload.chromeId, {
+                        windowId: newWindowChromeId,
+                        index: idx + 1
+                    }).catch(console.error);
+                }
+            }
         } else if (gp.definitionId === DEFINITIONS.BROWSER_TAB) {
             // Tab outdenting from Tab: become sibling of parent Tab in grandparent Tab's children
             const pl = gp.data as BrowserTabPayload;
@@ -292,6 +332,19 @@ class CaptureStore {
                 pl.children.splice(idx + 1, 0, id);
             } else {
                 pl.children.push(id);
+            }
+
+            // Move Chrome tab to parent tab's window
+            if (item.definitionId === DEFINITIONS.BROWSER_TAB && pl.chromeId !== undefined) {
+                const tabPayload = item.data as BrowserTabPayload;
+                chrome.tabs.get(pl.chromeId).then(parentTab => {
+                    if (tabPayload.chromeId !== undefined && parentTab?.windowId !== undefined) {
+                        chrome.tabs.move(tabPayload.chromeId, {
+                            windowId: parentTab.windowId,
+                            index: -1
+                        }).catch(console.error);
+                    }
+                }).catch(console.error);
             }
         }
         this.checkAndDeleteEmptyContainers(parentId);
@@ -317,10 +370,26 @@ class CaptureStore {
             return;
         }
 
+        const oldParent = this.items[parentId];
+        const oldParentWindowId = oldParent?.definitionId === DEFINITIONS.BROWSER_WINDOW
+            ? (oldParent.data as BrowserWindowPayload).chromeId
+            : undefined;
+
         this.removeFromParent(id, parentId);
 
         if (prevSibling.definitionId === DEFINITIONS.BROWSER_WINDOW) {
             (prevSibling.data as BrowserWindowPayload).tabs.push(id);
+            // Move Chrome tab to new window if both are active
+            if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const tabPayload = item.data as BrowserTabPayload;
+                const newWindowChromeId = (prevSibling.data as BrowserWindowPayload).chromeId;
+                if (tabPayload.chromeId !== undefined && newWindowChromeId !== undefined) {
+                    chrome.tabs.move(tabPayload.chromeId, {
+                        windowId: newWindowChromeId,
+                        index: -1 // Move to end
+                    }).catch(console.error);
+                }
+            }
         } else if (prevSibling.definitionId === DEFINITIONS.SESSION) {
             (prevSibling.data as SavedSessionPayload).windows.push(id);
         } else if (prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
@@ -330,6 +399,20 @@ class CaptureStore {
                 tabPayload.children = [];
             }
             tabPayload.children.push(id);
+            // Move Chrome tab to the parent tab's window if both are active
+            if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const childTabPayload = item.data as BrowserTabPayload;
+                if (tabPayload.chromeId !== undefined && childTabPayload.chromeId !== undefined) {
+                    chrome.tabs.get(tabPayload.chromeId).then(parentTab => {
+                        if (parentTab?.windowId !== undefined) {
+                            chrome.tabs.move(childTabPayload.chromeId!, {
+                                windowId: parentTab.windowId,
+                                index: -1
+                            }).catch(console.error);
+                        }
+                    }).catch(console.error);
+                }
+            }
         }
 
         this.checkAndDeleteEmptyContainers(parentId);
@@ -385,21 +468,39 @@ class CaptureStore {
     private upsertTab(tab: chrome.tabs.Tab, parentWindowId?: UUID) {
         if (!tab.id) return;
 
+        const winId = parentWindowId || this.activeChromeMap[tab.windowId];
+        if (!winId) return;
+
         let existingUUID: UUID | undefined;
+
+        // Priority 1: Check pendingRestores (tab being woken up)
         if (tab.url && this.pendingRestores.has(tab.url)) {
             existingUUID = this.pendingRestores.get(tab.url);
             this.pendingRestores.delete(tab.url);
         }
 
-        const winId = parentWindowId || this.activeChromeMap[tab.windowId];
-        if (!winId) return;
+        // Priority 2: Check activeChromeMap (already mapped Chrome tab)
+        if (!existingUUID) {
+            existingUUID = this.activeChromeMap[tab.id];
+        }
 
-        let tabId = existingUUID || this.activeChromeMap[tab.id];
-        if (!tabId && existingUUID) tabId = existingUUID;
+        // Priority 3: Check for existing inactive tab with same URL (prevent duplicates)
+        if (!existingUUID && tab.url) {
+            const inactiveTabId = this.findTabByUrlIncludingInactive(tab.url);
+            if (inactiveTabId) {
+                const inactiveTab = this.items[inactiveTabId];
+                if (inactiveTab && !(inactiveTab.data as BrowserTabPayload).isOpen) {
+                    // Found an inactive tab with the same URL - reuse it
+                    existingUUID = inactiveTabId;
+                }
+            }
+        }
 
+        let tabId = existingUUID;
         let tabItem = tabId ? (this.items[tabId] as MetaItem<BrowserTabPayload>) : undefined;
 
         if (!tabItem) {
+            // Only create new tab if we truly don't have an existing one
             tabId = crypto.randomUUID();
             tabItem = {
                 id: tabId,
@@ -418,6 +519,7 @@ class CaptureStore {
             this.items[tabId] = tabItem;
             (this.items[winId].data as BrowserWindowPayload).tabs.push(tabId);
         } else {
+            // Reactivate existing tab
             Object.assign(tabItem.data, {
                 url: tab.url,
                 title: tab.title,
@@ -429,7 +531,10 @@ class CaptureStore {
             });
             this.ensureTabInWindow(tabId, winId);
         }
+
+        // Always update the Chrome ID mapping
         this.activeChromeMap[tab.id] = tabId;
+
         // Trigger reactivity by updating state
         this.items = { ...this.items };
     }
@@ -443,6 +548,12 @@ class CaptureStore {
             tabItem.data.isOpen = false;
             if (!tabItem.data.status || tabItem.data.status === 'active') {
                 tabItem.data.status = 'closed';
+            }
+
+            // Check if parent window/container should be removed
+            const parentId = this.findParent(tabId);
+            if (parentId) {
+                this.checkAndDeleteEmptyContainers(parentId);
             }
         }
         delete this.activeChromeMap[chromeTabId];
@@ -470,6 +581,12 @@ class CaptureStore {
                     }
                 }
             });
+
+            // Check if parent session should remove this window
+            const parentId = this.findParent(winId);
+            if (parentId) {
+                this.checkAndDeleteEmptyContainers(parentId);
+            }
         }
         delete this.activeChromeMap[chromeWinId];
         // Trigger reactivity by updating state
@@ -652,10 +769,33 @@ class CaptureStore {
                 if (prevParent) {
                     if (prevParent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
                         (prevParent.data as BrowserWindowPayload).tabs.push(id);
+                        // Move Chrome tab to new window
+                        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                            const tabPayload = item.data as BrowserTabPayload;
+                            const newWindowChromeId = (prevParent.data as BrowserWindowPayload).chromeId;
+                            if (tabPayload.chromeId !== undefined && newWindowChromeId !== undefined) {
+                                chrome.tabs.move(tabPayload.chromeId, {
+                                    windowId: newWindowChromeId,
+                                    index: -1
+                                }).catch(console.error);
+                            }
+                        }
                     } else if (prevParent.definitionId === DEFINITIONS.BROWSER_TAB) {
                         const tabPayload = prevParent.data as BrowserTabPayload;
                         if (!tabPayload.children) tabPayload.children = [];
                         tabPayload.children.push(id);
+                        // Move Chrome tab to parent tab's window
+                        if (item.definitionId === DEFINITIONS.BROWSER_TAB && tabPayload.chromeId !== undefined) {
+                            const childTabPayload = item.data as BrowserTabPayload;
+                            chrome.tabs.get(tabPayload.chromeId).then(parentTab => {
+                                if (childTabPayload.chromeId !== undefined && parentTab?.windowId !== undefined) {
+                                    chrome.tabs.move(childTabPayload.chromeId, {
+                                        windowId: parentTab.windowId,
+                                        index: -1
+                                    }).catch(console.error);
+                                }
+                            }).catch(console.error);
+                        }
                     } else if (prevParent.definitionId === DEFINITIONS.SESSION) {
                         (prevParent.data as SavedSessionPayload).windows.push(id);
                     }
@@ -672,10 +812,33 @@ class CaptureStore {
                 if (nextParent) {
                     if (nextParent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
                         (nextParent.data as BrowserWindowPayload).tabs.unshift(id);
+                        // Move Chrome tab to new window
+                        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                            const tabPayload = item.data as BrowserTabPayload;
+                            const newWindowChromeId = (nextParent.data as BrowserWindowPayload).chromeId;
+                            if (tabPayload.chromeId !== undefined && newWindowChromeId !== undefined) {
+                                chrome.tabs.move(tabPayload.chromeId, {
+                                    windowId: newWindowChromeId,
+                                    index: 0
+                                }).catch(console.error);
+                            }
+                        }
                     } else if (nextParent.definitionId === DEFINITIONS.BROWSER_TAB) {
                         const tabPayload = nextParent.data as BrowserTabPayload;
                         if (!tabPayload.children) tabPayload.children = [];
                         tabPayload.children.unshift(id);
+                        // Move Chrome tab to parent tab's window
+                        if (item.definitionId === DEFINITIONS.BROWSER_TAB && tabPayload.chromeId !== undefined) {
+                            const childTabPayload = item.data as BrowserTabPayload;
+                            chrome.tabs.get(tabPayload.chromeId).then(parentTab => {
+                                if (childTabPayload.chromeId !== undefined && parentTab?.windowId !== undefined) {
+                                    chrome.tabs.move(childTabPayload.chromeId, {
+                                        windowId: parentTab.windowId,
+                                        index: 0
+                                    }).catch(console.error);
+                                }
+                            }).catch(console.error);
+                        }
                     } else if (nextParent.definitionId === DEFINITIONS.SESSION) {
                         (nextParent.data as SavedSessionPayload).windows.unshift(id);
                     }
@@ -690,6 +853,21 @@ class CaptureStore {
 
         // Normal swap within siblings - modify the actual array
         [siblings[index], siblings[newIndex]] = [siblings[newIndex], siblings[index]];
+
+        // Sync with Chrome if parent is a window and items are tabs
+        if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW && item.definitionId === DEFINITIONS.BROWSER_TAB) {
+            const tabPayload = item.data as BrowserTabPayload;
+            const parentWindowChromeId = (parent.data as BrowserWindowPayload).chromeId;
+
+            // Only move if tab is active and parent window is active
+            if (tabPayload.chromeId !== undefined && parentWindowChromeId !== undefined) {
+                chrome.tabs.move(tabPayload.chromeId, {
+                    windowId: parentWindowChromeId,
+                    index: newIndex
+                }).catch(console.error);
+            }
+        }
+
         this.items = { ...this.items }; // Trigger reactivity
         this.save();
         // Maintain focus after operation
@@ -759,6 +937,53 @@ class CaptureStore {
     }
 
     setFocus(id: UUID | null) { this.focusedNodeId = id; }
+
+    handleSort(parentId: UUID | 'ROOT', newItems: { id: UUID }[]) {
+        // Extract UUIDs from the newItems array
+        const newOrder = newItems.map(item => item.id);
+
+        // Handle ROOT case (root session)
+        const actualParentId = parentId === 'ROOT' ? this.rootSessionId : parentId;
+        const parent = this.items[actualParentId];
+
+        if (!parent) return;
+
+        // Update the children array based on parent type
+        if (parent.definitionId === DEFINITIONS.SESSION) {
+            (parent.data as SavedSessionPayload).windows = newOrder;
+        } else if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            (parent.data as BrowserWindowPayload).tabs = newOrder;
+        } else if (parent.definitionId === DEFINITIONS.BROWSER_TAB) {
+            (parent.data as BrowserTabPayload).children = newOrder;
+        }
+
+        // Sync Chrome tabs if parent is a window and tabs are active
+        if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            const windowChromeId = (parent.data as BrowserWindowPayload).chromeId;
+            if (windowChromeId !== undefined) {
+                // Move Chrome tabs to match new order
+                // Only move tabs that are actually active in Chrome
+                newOrder.forEach((tabId, index) => {
+                    const tabItem = this.items[tabId];
+                    if (tabItem?.definitionId === DEFINITIONS.BROWSER_TAB) {
+                        const tabPayload = tabItem.data as BrowserTabPayload;
+                        if (tabPayload.chromeId !== undefined && tabPayload.isOpen) {
+                            chrome.tabs.move(tabPayload.chromeId, {
+                                windowId: windowChromeId,
+                                index: index
+                            }).catch(console.error);
+                        }
+                    }
+                });
+            }
+        }
+
+        // Trigger reactivity
+        this.items = { ...this.items };
+
+        // Persist to storage immediately
+        this.save();
+    }
 
     async archiveNode(id: UUID) {
         const item = this.items[id];
