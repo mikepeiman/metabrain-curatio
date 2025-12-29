@@ -61,8 +61,23 @@
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       captureStore.navigateFocus("up");
+    } else if (e.key === "Delete" || e.key === "Backspace") {
+      // Delete/Archive focused item
+      if (focusedId && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        captureStore.archiveNode(focusedId);
+      }
     }
   }
+
+  // Close context menus when clicking outside
+  $effect(() => {
+    function handleClickOutside() {
+      // Context menus will handle their own closing
+    }
+    document.addEventListener("click", handleClickOutside);
+    return () => document.removeEventListener("click", handleClickOutside);
+  });
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->

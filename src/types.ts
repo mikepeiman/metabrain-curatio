@@ -8,6 +8,7 @@ export interface BrowserTabPayload {
   chromeId?: number; // Chrome tab ID (undefined when ghost)
   isOpen?: boolean; // true when active in Chrome, false when ghost
   children?: UUID[]; // Child tabs (for grouping/nesting)
+  status?: 'active' | 'closed' | 'archived'; // Item state: active (visible), closed (ghost), archived (hidden)
 }
 
 export interface BrowserWindowPayload {
@@ -15,6 +16,7 @@ export interface BrowserWindowPayload {
   tabs: UUID[];
   chromeId?: number; // Chrome window ID (undefined when ghost)
   isOpen?: boolean; // true when active in Chrome, false when ghost
+  status?: 'active' | 'closed' | 'archived'; // Item state: active (visible), closed (ghost), archived (hidden)
 }
 
 export interface SavedSessionPayload {

@@ -298,7 +298,8 @@ class CaptureStore {
                 name: `Window ${win.id}`,
                 tabs: [],
                 chromeId: win.id,
-                isOpen: true
+                isOpen: true,
+                status: 'active'
             } as BrowserWindowPayload
         };
 
@@ -340,7 +341,8 @@ class CaptureStore {
                     favIconUrl: tab.favIconUrl,
                     isPinned: tab.pinned,
                     chromeId: tab.id,
-                    isOpen: true
+                    isOpen: true,
+                    status: 'active'
                 }
             };
             this.items[tabId] = tabItem;
@@ -366,6 +368,9 @@ class CaptureStore {
         if (tabItem) {
             tabItem.data.chromeId = undefined;
             tabItem.data.isOpen = false;
+            if (!tabItem.data.status || tabItem.data.status === 'active') {
+                tabItem.data.status = 'closed';
+            }
         }
         delete this.activeChromeMap[chromeTabId];
     }
@@ -377,19 +382,34 @@ class CaptureStore {
         if (winItem) {
             winItem.data.chromeId = undefined;
             winItem.data.isOpen = false;
+            if (!winItem.data.status || winItem.data.status === 'active') {
+                winItem.data.status = 'closed';
+            }
             winItem.data.tabs.forEach(tId => {
                 const t = this.items[tId] as MetaItem<BrowserTabPayload>;
-                if (t) { t.data.chromeId = undefined; t.data.isOpen = false; }
+                if (t) {
+                    t.data.chromeId = undefined;
+                    t.data.isOpen = false;
+                    if (!t.data.status || t.data.status === 'active') {
+                        t.data.status = 'closed';
+                    }
+                }
             });
         }
         delete this.activeChromeMap[chromeWinId];
     }
 
     private ensureTabInWindow(tabId: UUID, windowId: UUID) {
+        // Remove tab from all windows and tab children arrays to prevent duplicates
         Object.values(this.items).forEach(item => {
             if (item.definitionId === DEFINITIONS.BROWSER_WINDOW && item.id !== windowId) {
                 const pl = item.data as BrowserWindowPayload;
                 pl.tabs = pl.tabs.filter(id => id !== tabId);
+            } else if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const tabPayload = item.data as BrowserTabPayload;
+                if (tabPayload.children) {
+                    tabPayload.children = tabPayload.children.filter(id => id !== tabId);
+                }
             }
         });
         const pl = this.items[windowId].data as BrowserWindowPayload;
@@ -425,16 +445,43 @@ class CaptureStore {
     getChildren(id: UUID): UUID[] {
         const item = this.items[id];
         if (!item) return [];
-        if (item.definitionId === DEFINITIONS.SESSION) return (item.data as SavedSessionPayload).windows || [];
-        if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) return (item.data as BrowserWindowPayload).tabs || [];
-        if (item.definitionId === DEFINITIONS.BROWSER_TAB) return (item.data as BrowserTabPayload).children || [];
+
+        // Filter out archived items
+        const filterArchived = (ids: UUID[]): UUID[] => {
+            return ids.filter(childId => {
+                const child = this.items[childId];
+                if (!child) return false;
+                if (child.definitionId === DEFINITIONS.BROWSER_TAB) {
+                    return (child.data as BrowserTabPayload).status !== 'archived';
+                } else if (child.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                    return (child.data as BrowserWindowPayload).status !== 'archived';
+                }
+                return true;
+            });
+        };
+
+        if (item.definitionId === DEFINITIONS.SESSION) {
+            return filterArchived((item.data as SavedSessionPayload).windows || []);
+        }
+        if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            return filterArchived((item.data as BrowserWindowPayload).tabs || []);
+        }
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+            return filterArchived((item.data as BrowserTabPayload).children || []);
+        }
         return [];
     }
 
     get flatVisibleNodes(): UUID[] {
         const result: UUID[] = [];
+        const seen = new Set<UUID>(); // Prevent duplicates
 
         const traverse = (nodeId: UUID) => {
+            if (seen.has(nodeId)) {
+                console.warn(`[CaptureStore] Duplicate node detected: ${nodeId}`);
+                return; // Skip duplicates
+            }
+            seen.add(nodeId);
             result.push(nodeId);
             const children = this.getChildren(nodeId);
             children.forEach(childId => traverse(childId));
@@ -457,11 +504,57 @@ class CaptureStore {
         if (index < 0) return;
 
         const newIndex = direction === 'up' ? index - 1 : index + 1;
-        if (newIndex < 0 || newIndex >= siblings.length) return;
 
-        // Swap nodes
+        // If at boundary, try to move to adjacent parent
+        if (newIndex < 0 || newIndex >= siblings.length) {
+            const grandparentId = this.findParent(parentId);
+            if (!grandparentId) return; // Can't move beyond root
+
+            const grandparentSiblings = this.getChildren(grandparentId);
+            const parentIndex = grandparentSiblings.indexOf(parentId);
+
+            if (direction === 'up' && index === 0 && parentIndex > 0) {
+                // Move to end of previous sibling
+                const prevParentId = grandparentSiblings[parentIndex - 1];
+                this.removeFromParent(id, parentId);
+                const prevParent = this.items[prevParentId];
+                if (prevParent) {
+                    if (prevParent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                        (prevParent.data as BrowserWindowPayload).tabs.push(id);
+                    } else if (prevParent.definitionId === DEFINITIONS.BROWSER_TAB) {
+                        const tabPayload = prevParent.data as BrowserTabPayload;
+                        if (!tabPayload.children) tabPayload.children = [];
+                        tabPayload.children.push(id);
+                    } else if (prevParent.definitionId === DEFINITIONS.SESSION) {
+                        (prevParent.data as SavedSessionPayload).windows.push(id);
+                    }
+                }
+                this.save();
+                return;
+            } else if (direction === 'down' && index === siblings.length - 1 && parentIndex < grandparentSiblings.length - 1) {
+                // Move to start of next sibling
+                const nextParentId = grandparentSiblings[parentIndex + 1];
+                this.removeFromParent(id, parentId);
+                const nextParent = this.items[nextParentId];
+                if (nextParent) {
+                    if (nextParent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                        (nextParent.data as BrowserWindowPayload).tabs.unshift(id);
+                    } else if (nextParent.definitionId === DEFINITIONS.BROWSER_TAB) {
+                        const tabPayload = nextParent.data as BrowserTabPayload;
+                        if (!tabPayload.children) tabPayload.children = [];
+                        tabPayload.children.unshift(id);
+                    } else if (nextParent.definitionId === DEFINITIONS.SESSION) {
+                        (nextParent.data as SavedSessionPayload).windows.unshift(id);
+                    }
+                }
+                this.save();
+                return;
+            }
+            return; // Can't move beyond boundaries
+        }
+
+        // Normal swap within siblings
         [siblings[index], siblings[newIndex]] = [siblings[newIndex], siblings[index]];
-
         this.save();
     }
 
@@ -489,6 +582,77 @@ class CaptureStore {
 
     setFocus(id: UUID | null) { this.focusedNodeId = id; }
 
+    async archiveNode(id: UUID) {
+        const item = this.items[id];
+        if (!item) return;
+
+        // Remove from parent
+        const parentId = this.findParent(id);
+        if (parentId) {
+            this.removeFromParent(id, parentId);
+        }
+
+        // Mark as archived
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+            (item.data as BrowserTabPayload).status = 'archived';
+            (item.data as BrowserTabPayload).isOpen = false;
+            (item.data as BrowserTabPayload).chromeId = undefined;
+        } else if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            (item.data as BrowserWindowPayload).status = 'archived';
+            (item.data as BrowserWindowPayload).isOpen = false;
+            (item.data as BrowserWindowPayload).chromeId = undefined;
+            // Archive all child tabs
+            const windowPayload = item.data as BrowserWindowPayload;
+            windowPayload.tabs.forEach(tabId => {
+                this.archiveNode(tabId);
+            });
+        }
+
+        // Remove from activeChromeMap if present
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+            const chromeId = (item.data as BrowserTabPayload).chromeId;
+            if (chromeId !== undefined) {
+                delete this.activeChromeMap[chromeId];
+            }
+        } else if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            const chromeId = (item.data as BrowserWindowPayload).chromeId;
+            if (chromeId !== undefined) {
+                delete this.activeChromeMap[chromeId];
+            }
+        }
+
+        this.save();
+    }
+
+    async focusChromeTab(id: UUID) {
+        const item = this.items[id];
+        if (!item) return;
+
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+            const payload = item.data as BrowserTabPayload;
+            if (payload.chromeId !== undefined && payload.isOpen) {
+                try {
+                    await chrome.tabs.update(payload.chromeId, { active: true });
+                    const tab = await chrome.tabs.get(payload.chromeId);
+                    if (tab.windowId !== undefined) {
+                        await chrome.windows.update(tab.windowId, { focused: true });
+                    }
+                } catch (e) {
+                    console.error('Failed to focus Chrome tab:', e);
+                }
+            }
+        } else if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+            const payload = item.data as BrowserWindowPayload;
+            if (payload.chromeId !== undefined && payload.isOpen) {
+                try {
+                    await chrome.windows.update(payload.chromeId, { focused: true });
+                } catch (e) {
+                    console.error('Failed to focus Chrome window:', e);
+                }
+            }
+        }
+    }
+
     async clearStorage() {
         if (this.storageListener) chrome.storage.onChanged.removeListener(this.storageListener);
         await metabrainStorage.clear();
@@ -498,7 +662,21 @@ class CaptureStore {
         if (this.isBackground) await this.init(true);
     }
 
-    private async save() {
+    async save() {
+        // Only background script can write, but allow popup to trigger save via message
+        if (!this.isBackground) {
+            // Send message to background to save
+            chrome.runtime.sendMessage({
+                type: 'SAVE_STATE', data: {
+                    items: $state.snapshot(this.items),
+                    rootSessionId: this.rootSessionId,
+                    activeChromeMap: $state.snapshot(this.activeChromeMap)
+                }
+            }).catch(() => {
+                // Background might not be ready, that's okay
+            });
+            return;
+        }
         await metabrainStorage.save({
             items: $state.snapshot(this.items),
             rootSessionId: this.rootSessionId,

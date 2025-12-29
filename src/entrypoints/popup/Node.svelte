@@ -53,9 +53,78 @@
     captureStore.setFocus(id);
   }
 
+  let isEditingTitle = $state(false);
+  let editValue = $state("");
+
   function handleDoubleClick(e: MouseEvent) {
     e.stopPropagation();
-    captureStore.toggleOpen(id);
+
+    if (item?.definitionId === DEFINITIONS.BROWSER_TAB) {
+      const payload = item.data as BrowserTabPayload;
+      // If tab is open, focus it in Chrome
+      if (payload.isOpen && payload.chromeId !== undefined) {
+        captureStore.focusChromeTab(id);
+      } else {
+        // Otherwise toggle open/closed
+        captureStore.toggleOpen(id);
+      }
+    } else if (item?.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+      const payload = item.data as BrowserWindowPayload;
+      // If window is open, focus it; otherwise make title editable
+      if (payload.isOpen && payload.chromeId !== undefined) {
+        captureStore.focusChromeTab(id);
+      } else {
+        // Make window title editable
+        editValue = payload.name || "";
+        isEditingTitle = true;
+      }
+    } else {
+      captureStore.toggleOpen(id);
+    }
+  }
+
+  function handleTitleKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveTitle();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      isEditingTitle = false;
+    }
+  }
+
+  function saveTitle() {
+    if (item?.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+      (item.data as BrowserWindowPayload).name = editValue;
+      captureStore.save();
+    }
+    isEditingTitle = false;
+  }
+
+  function handleContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    // TODO: Show context menu
+    showContextMenu(e.clientX, e.clientY);
+  }
+
+  let contextMenuVisible = $state(false);
+  let contextMenuX = $state(0);
+  let contextMenuY = $state(0);
+
+  function showContextMenu(x: number, y: number) {
+    contextMenuX = x;
+    contextMenuY = y;
+    contextMenuVisible = true;
+  }
+
+  function hideContextMenu() {
+    contextMenuVisible = false;
+  }
+
+  function handleDelete() {
+    captureStore.archiveNode(id);
+    hideContextMenu();
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -81,27 +150,88 @@
     // Don't stop propagation for plain arrow keys
   }
 
+  // Check if this is the currently active Chrome window/tab
+  const isChromeFocused = $derived.by(() => {
+    if (!item) return false;
+    if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+      const payload = item.data as BrowserTabPayload;
+      // TODO: Check if this is the active Chrome tab
+      return payload.isOpen === true;
+    } else if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+      const payload = item.data as BrowserWindowPayload;
+      // TODO: Check if this is the active Chrome window
+      return payload.isOpen === true;
+    }
+    return false;
+  });
+
   // Template literal for safe class construction
   const nodeClasses = $derived(
-    `flex items-center py-0.5 text-base transition-colors outline-none select-none cursor-pointer
+    `flex items-center py-0.5 text-base transition-colors outline-none select-none cursor-pointer relative
        ${isActive ? "text-neutral-100" : "text-neutral-500"} 
-       ${isFocused ? "bg-indigo-500/20 border-l-2 border-indigo-500 pl-[calc(1.5rem-2px)]" : "border-l-2 border-transparent hover:bg-neutral-800/50"}`,
+       ${isFocused ? "bg-indigo-500/20 border-l-2 border-indigo-500" : "border-l-2 border-transparent hover:bg-neutral-800/50"}
+       ${isChromeFocused ? "ring-1 ring-blue-400/50" : ""}`,
   );
+
+  // Generate indentation guide lines
+  const indentGuides = $derived.by(() => {
+    const guides: number[] = [];
+    for (let i = 0; i < depth; i++) {
+      guides.push(i);
+    }
+    return guides;
+  });
+
+  $effect(() => {
+    if (isEditingTitle && item) {
+      // Select all text when editing starts
+      setTimeout(() => {
+        const input = document.querySelector(
+          `input[data-node-id="${id}"]`,
+        ) as HTMLInputElement;
+        if (input) {
+          input.select();
+          input.focus();
+        }
+      }, 0);
+    }
+  });
+
+  // Close context menu when clicking outside
+  $effect(() => {
+    if (contextMenuVisible) {
+      function handleClickOutside(e: MouseEvent) {
+        const target = e.target as HTMLElement;
+        if (!target.closest("[data-context-menu]")) {
+          hideContextMenu();
+        }
+      }
+      document.addEventListener("click", handleClickOutside);
+      return () => document.removeEventListener("click", handleClickOutside);
+    }
+  });
 </script>
 
 {#if item}
   <div
     class={nodeClasses}
-    style={!isFocused
-      ? `padding-left: ${depth * 1.5}rem;`
-      : `padding-left: ${depth * 1.5}rem;`}
+    style={`padding-left: ${depth * 1.5}rem;`}
     onclick={handleClick}
     ondblclick={handleDoubleClick}
     onkeydown={handleKeydown}
+    oncontextmenu={handleContextMenu}
     tabindex="0"
     role="treeitem"
     aria-selected={isFocused}>
-    <div class="flex items-center gap-2 min-w-0 flex-1">
+    <!-- Indentation Guide Lines -->
+    {#each indentGuides as guideDepth}
+      <div
+        class="absolute left-0 top-0 bottom-0 w-px bg-neutral-800/30"
+        style={`left: ${guideDepth * 1.5}rem;`}>
+      </div>
+    {/each}
+
+    <div class="flex items-center gap-2 min-w-0 flex-1 relative z-10">
       <!-- Icon Container -->
       <div class="w-4 h-4 shrink-0 flex items-center justify-center">
         {#if favIconUrl}
@@ -118,8 +248,20 @@
         {/if}
       </div>
 
-      <!-- Text -->
-      <span class="truncate">{displayName}</span>
+      <!-- Text or Editable Input -->
+      {#if isEditingTitle && item.definitionId === DEFINITIONS.BROWSER_WINDOW}
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          data-node-id={id}
+          type="text"
+          bind:value={editValue}
+          onkeydown={handleTitleKeydown}
+          onblur={saveTitle}
+          class="bg-neutral-800 text-neutral-100 px-1 py-0 rounded border border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 flex-1 min-w-0"
+          autofocus />
+      {:else}
+        <span class="truncate">{displayName}</span>
+      {/if}
 
       <!-- Ghost Label -->
       {#if !isActive}
@@ -129,6 +271,60 @@
       {/if}
     </div>
   </div>
+
+  <!-- Context Menu -->
+  {#if contextMenuVisible}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      data-context-menu
+      class="fixed bg-neutral-800 border border-neutral-700 rounded shadow-lg py-1 z-50 min-w-37.5"
+      style={`left: ${contextMenuX}px; top: ${contextMenuY}px;`}
+      role="menu"
+      tabindex="0"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => {
+        if (e.key === "Escape") hideContextMenu();
+      }}>
+      <button
+        class="w-full text-left px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-700 transition-colors"
+        onclick={handleDelete}>
+        Archive
+      </button>
+      <button
+        class="w-full text-left px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-700 transition-colors"
+        onclick={() => {
+          captureStore.indentNode(id);
+          hideContextMenu();
+        }}>
+        Indent (Ctrl+→)
+      </button>
+      <button
+        class="w-full text-left px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-700 transition-colors"
+        onclick={() => {
+          captureStore.outdentNode(id);
+          hideContextMenu();
+        }}>
+        Outdent (Ctrl+←)
+      </button>
+      <button
+        class="w-full text-left px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-700 transition-colors"
+        onclick={() => {
+          captureStore.moveNode(id, "up");
+          hideContextMenu();
+        }}>
+        Move Up (Ctrl+↑)
+      </button>
+      <button
+        class="w-full text-left px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-700 transition-colors"
+        onclick={() => {
+          captureStore.moveNode(id, "down");
+          hideContextMenu();
+        }}>
+        Move Down (Ctrl+↓)
+      </button>
+    </div>
+  {/if}
 
   <!-- Recursive Children -->
   {#if children.length > 0}
