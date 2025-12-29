@@ -49,6 +49,11 @@
   let isCollapsed = $state(false);
   let isEditingTitle = $state(false);
   let editValue = $state("");
+  let contextMenu = $state<{ visible: boolean; x: number; y: number }>({
+    visible: false,
+    x: 0,
+    y: 0,
+  });
 
   function handleBulletClick(e: MouseEvent) {
     e.stopPropagation();
@@ -115,6 +120,60 @@
     isEditingTitle = false;
   }
 
+  function handleContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    captureStore.setFocus(id);
+    contextMenu = { visible: true, x: e.clientX, y: e.clientY };
+  }
+
+  function closeContextMenu() {
+    contextMenu = { ...contextMenu, visible: false };
+  }
+
+  async function handleMenuAction(action: string) {
+    closeContextMenu();
+    switch (action) {
+      case "focus":
+        captureStore.setFocus(id);
+        await captureStore.focusChromeTab(id);
+        break;
+      case "toggle":
+        await captureStore.toggleOpen(id);
+        break;
+      case "indent":
+        await captureStore.indentNode(id);
+        break;
+      case "outdent":
+        await captureStore.outdentNode(id);
+        break;
+      case "moveUp":
+        await captureStore.moveNode(id, "up");
+        break;
+      case "moveDown":
+        await captureStore.moveNode(id, "down");
+        break;
+      case "rename":
+        if (item?.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+          editValue = (item.data as BrowserWindowPayload).name || "";
+          isEditingTitle = true;
+        }
+        break;
+    }
+  }
+
+  $effect(() => {
+    const close = () => {
+      if (contextMenu.visible) closeContextMenu();
+    };
+    document.addEventListener("click", close);
+    document.addEventListener("contextmenu", close);
+    return () => {
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+    };
+  });
+
   // Transform UUIDs to objects with id property for dndzone
   const dndItems = $derived(children.map((childId) => ({ id: childId })));
 
@@ -168,6 +227,7 @@
         ${isSelected ? "bg-blue-500/10" : ""}`}
       onclick={handleContentClick}
       ondblclick={handleDoubleClick}
+      oncontextmenu={handleContextMenu}
       role="treeitem"
       aria-selected={isFocused}>
       <!-- Favicon/Icon -->
@@ -220,6 +280,22 @@
         </button>
       {/if}
     </div>
+    {#if contextMenu.visible}
+      <div
+        class="fixed z-50 bg-neutral-900 border border-neutral-700 rounded shadow-lg text-sm text-white"
+        style={`top:${contextMenu.y}px; left:${contextMenu.x}px`}
+        onclick={(e) => e.stopPropagation()}>
+        <button class="block w-full text-left px-3 py-1 hover:bg-neutral-800" onclick={() => handleMenuAction("focus")}>Focus</button>
+        <button class="block w-full text-left px-3 py-1 hover:bg-neutral-800" onclick={() => handleMenuAction("toggle")}>{isActive ? "Sleep" : "Wake"}</button>
+        <button class="block w-full text-left px-3 py-1 hover:bg-neutral-800" onclick={() => handleMenuAction("indent")}>Indent</button>
+        <button class="block w-full text-left px-3 py-1 hover:bg-neutral-800" onclick={() => handleMenuAction("outdent")}>Outdent</button>
+        <button class="block w-full text-left px-3 py-1 hover:bg-neutral-800" onclick={() => handleMenuAction("moveUp")}>Move Up</button>
+        <button class="block w-full text-left px-3 py-1 hover:bg-neutral-800" onclick={() => handleMenuAction("moveDown")}>Move Down</button>
+        {#if item.definitionId === DEFINITIONS.BROWSER_WINDOW}
+          <button class="block w-full text-left px-3 py-1 hover:bg-neutral-800" onclick={() => handleMenuAction("rename")}>Rename</button>
+        {/if}
+      </div>
+    {/if}
   </div>
 
   <!-- Children Container with Guide Line and DnD -->
