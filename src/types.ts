@@ -7,6 +7,7 @@ export interface BrowserTabPayload {
   isPinned?: boolean;
   chromeId?: number; // Chrome tab ID (undefined when ghost)
   isOpen?: boolean; // true when active in Chrome, false when ghost
+  children?: UUID[]; // Child tabs (for grouping/nesting)
 }
 
 export interface BrowserWindowPayload {

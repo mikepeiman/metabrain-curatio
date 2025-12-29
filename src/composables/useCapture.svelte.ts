@@ -219,6 +219,18 @@ class CaptureStore {
             const pl = gp.data as BrowserWindowPayload;
             const idx = pl.tabs.indexOf(parentId);
             pl.tabs.splice(idx + 1, 0, id);
+        } else if (gp.definitionId === DEFINITIONS.BROWSER_TAB) {
+            // Tab outdenting from Tab: become sibling of parent Tab in grandparent Tab's children
+            const pl = gp.data as BrowserTabPayload;
+            if (!pl.children) {
+                pl.children = [];
+            }
+            const idx = pl.children.indexOf(parentId);
+            if (idx >= 0) {
+                pl.children.splice(idx + 1, 0, id);
+            } else {
+                pl.children.push(id);
+            }
         }
         this.save();
     }
@@ -234,9 +246,10 @@ class CaptureStore {
 
         const prevSiblingId = siblings[index - 1];
         const prevSibling = this.items[prevSiblingId];
+        if (!prevSibling) return;
 
-        if (item.definitionId === DEFINITIONS.BROWSER_TAB && prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
-            console.warn("Grouping tabs not yet implemented");
+        // Constraint: A Tab cannot have a Window as a child
+        if (item.definitionId === DEFINITIONS.BROWSER_WINDOW && prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
             return;
         }
 
@@ -246,6 +259,13 @@ class CaptureStore {
             (prevSibling.data as BrowserWindowPayload).tabs.push(id);
         } else if (prevSibling.definitionId === DEFINITIONS.SESSION) {
             (prevSibling.data as SavedSessionPayload).windows.push(id);
+        } else if (prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
+            // Tab-into-Tab nesting: initialize children array if missing
+            const tabPayload = prevSibling.data as BrowserTabPayload;
+            if (!tabPayload.children) {
+                tabPayload.children = [];
+            }
+            tabPayload.children.push(id);
         }
 
         this.save();
@@ -393,6 +413,11 @@ class CaptureStore {
             } else if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
                 const pl = parent.data as BrowserWindowPayload;
                 pl.tabs = pl.tabs.filter(id => id !== childId);
+            } else if (parent.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const pl = parent.data as BrowserTabPayload;
+                if (pl.children) {
+                    pl.children = pl.children.filter(id => id !== childId);
+                }
             }
         }
     }
@@ -402,7 +427,64 @@ class CaptureStore {
         if (!item) return [];
         if (item.definitionId === DEFINITIONS.SESSION) return (item.data as SavedSessionPayload).windows || [];
         if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) return (item.data as BrowserWindowPayload).tabs || [];
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB) return (item.data as BrowserTabPayload).children || [];
         return [];
+    }
+
+    get flatVisibleNodes(): UUID[] {
+        const result: UUID[] = [];
+
+        const traverse = (nodeId: UUID) => {
+            result.push(nodeId);
+            const children = this.getChildren(nodeId);
+            children.forEach(childId => traverse(childId));
+        };
+
+        if (this.rootSessionId) {
+            traverse(this.rootSessionId);
+        }
+
+        return result;
+    }
+
+    moveNode(id: UUID, direction: 'up' | 'down') {
+        const item = this.items[id];
+        const parentId = this.findParent(id);
+        if (!item || !parentId) return;
+
+        const siblings = this.getChildren(parentId);
+        const index = siblings.indexOf(id);
+        if (index < 0) return;
+
+        const newIndex = direction === 'up' ? index - 1 : index + 1;
+        if (newIndex < 0 || newIndex >= siblings.length) return;
+
+        // Swap nodes
+        [siblings[index], siblings[newIndex]] = [siblings[newIndex], siblings[index]];
+
+        this.save();
+    }
+
+    navigateFocus(direction: 'up' | 'down') {
+        const nodes = this.flatVisibleNodes;
+        if (nodes.length === 0) return;
+
+        const currentIndex = this.focusedNodeId !== null
+            ? nodes.indexOf(this.focusedNodeId)
+            : -1;
+
+        let newIndex: number;
+        if (currentIndex < 0) {
+            // No focus currently, set to first or last
+            newIndex = direction === 'down' ? 0 : nodes.length - 1;
+        } else {
+            newIndex = direction === 'down' ? currentIndex + 1 : currentIndex - 1;
+            newIndex = Math.max(0, Math.min(newIndex, nodes.length - 1));
+        }
+
+        if (newIndex >= 0 && newIndex < nodes.length) {
+            this.setFocus(nodes[newIndex]);
+        }
     }
 
     setFocus(id: UUID | null) { this.focusedNodeId = id; }

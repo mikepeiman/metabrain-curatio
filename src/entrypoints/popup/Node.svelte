@@ -59,20 +59,26 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    // Only handle keyboard events when this node is focused
     if (!isFocused) return;
 
-    // Stop propagation so parents don't handle this too
-    e.stopPropagation();
-
+    // Handle Ctrl/Cmd + Arrow keys for indent/outdent
     if (e.ctrlKey || e.metaKey) {
       if (e.key === "ArrowRight") {
         e.preventDefault();
+        e.stopPropagation();
         captureStore.indentNode(id);
+        return;
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
+        e.stopPropagation();
         captureStore.outdentNode(id);
+        return;
       }
     }
+
+    // For other keys, let the parent handle them (for focus navigation)
+    // Don't stop propagation for plain arrow keys
   }
 
   // Template literal for safe class construction

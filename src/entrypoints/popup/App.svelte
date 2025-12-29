@@ -18,39 +18,49 @@
     rootSession ? captureStore.getChildren(captureStore.rootSessionId) : [],
   );
 
-  // Get all node IDs in order for keyboard navigation
-  function getAllNodeIds(parentId: UUID, result: UUID[] = []): UUID[] {
-    result.push(parentId);
-    const children = captureStore.getChildren(parentId);
-    children.forEach((childId) => getAllNodeIds(childId, result));
-    return result;
-  }
-
-  const allNodeIds = $derived.by(() => {
-    if (!captureStore.rootSessionId) return [];
-    return getAllNodeIds(captureStore.rootSessionId);
-  });
-
   function handleKeydown(e: KeyboardEvent) {
-    const nodeIds = allNodeIds;
+    const focusedId = captureStore.focusedNodeId;
+
+    // Handle Ctrl/Cmd + Arrow keys for structure manipulation
+    if (e.ctrlKey || e.metaKey) {
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (focusedId) {
+          captureStore.moveNode(focusedId, "up");
+        }
+        return;
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (focusedId) {
+          captureStore.moveNode(focusedId, "down");
+        }
+        return;
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (focusedId) {
+          captureStore.outdentNode(focusedId);
+        }
+        return;
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (focusedId) {
+          captureStore.indentNode(focusedId);
+        }
+        return;
+      }
+    }
+
+    // Handle plain Arrow keys for focus navigation
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      const currentIndex = captureStore.focusedNodeId
-        ? nodeIds.indexOf(captureStore.focusedNodeId)
-        : -1;
-      const nextIndex = Math.min(currentIndex + 1, nodeIds.length - 1);
-      if (nextIndex >= 0 && nodeIds[nextIndex]) {
-        captureStore.setFocus(nodeIds[nextIndex]);
-      }
+      captureStore.navigateFocus("down");
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      const currentIndex = captureStore.focusedNodeId
-        ? nodeIds.indexOf(captureStore.focusedNodeId)
-        : -1;
-      const prevIndex = Math.max(currentIndex - 1, 0);
-      if (prevIndex >= 0 && nodeIds[prevIndex]) {
-        captureStore.setFocus(nodeIds[prevIndex]);
-      }
+      captureStore.navigateFocus("up");
     }
   }
 </script>
