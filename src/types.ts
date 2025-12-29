@@ -5,11 +5,15 @@ export interface BrowserTabPayload {
   title?: string;
   favIconUrl?: string;
   isPinned?: boolean;
+  chromeId?: number; // Chrome tab ID (undefined when ghost)
+  isOpen?: boolean; // true when active in Chrome, false when ghost
 }
 
 export interface BrowserWindowPayload {
   name?: string;
   tabs: UUID[];
+  chromeId?: number; // Chrome window ID (undefined when ghost)
+  isOpen?: boolean; // true when active in Chrome, false when ghost
 }
 
 export interface SavedSessionPayload {

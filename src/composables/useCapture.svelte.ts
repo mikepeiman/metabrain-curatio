@@ -81,17 +81,52 @@ class CaptureStore {
     private async syncWithChrome() {
         const windows = await chrome.windows.getAll({ populate: true });
         const currentWindowIds = new Set(windows.map(win => win.id).filter((id): id is number => id !== undefined));
+        const currentTabIds = new Set<number>();
 
-        // Remove stale entries from activeChromeMap (windows that no longer exist)
-        Object.keys(this.activeChromeMap).forEach(chromeId => {
-            const id = Number(chromeId);
-            if (!currentWindowIds.has(id)) {
-                delete this.activeChromeMap[id];
+        // Collect all current tab IDs
+        windows.forEach(win => {
+            win.tabs?.forEach(tab => {
+                if (tab.id !== undefined) {
+                    currentTabIds.add(tab.id);
+                }
+            });
+        });
+
+        // Mark items as ghost if they have a chromeId but are no longer in Chrome
+        Object.values(this.items).forEach(item => {
+            if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
+                const payload = item.data as BrowserWindowPayload;
+                const chromeId = payload.chromeId;
+                if (chromeId !== undefined && payload.isOpen && !currentWindowIds.has(chromeId)) {
+                    // Window was closed, mark as ghost
+                    payload.chromeId = undefined;
+                    payload.isOpen = false;
+                    // Also mark child tabs as ghost
+                    payload.tabs.forEach(tabId => {
+                        const tabItem = this.items[tabId] as MetaItem<BrowserTabPayload> | undefined;
+                        if (tabItem) {
+                            tabItem.data.chromeId = undefined;
+                            tabItem.data.isOpen = false;
+                        }
+                    });
+                    // Remove from activeChromeMap
+                    delete this.activeChromeMap[chromeId];
+                }
+            } else if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                const payload = item.data as BrowserTabPayload;
+                const chromeId = payload.chromeId;
+                if (chromeId !== undefined && payload.isOpen && !currentTabIds.has(chromeId)) {
+                    // Tab was closed, mark as ghost
+                    payload.chromeId = undefined;
+                    payload.isOpen = false;
+                    // Remove from activeChromeMap
+                    delete this.activeChromeMap[chromeId];
+                }
             }
         });
 
         // Process all current Chrome windows - upsertWindow will handle deduplication
-        // and won't create duplicate MetaItems if window already exists
+        // and will reactivate ghost windows/tabs if they're reopened
         windows.forEach(win => this.upsertWindow(win));
 
         await this.save();
@@ -104,7 +139,7 @@ class CaptureStore {
         });
 
         chrome.windows.onRemoved.addListener((windowId: number) => {
-            delete this.activeChromeMap[windowId];
+            this.markWindowAsGhost(windowId);
             this.save();
         });
 
@@ -119,7 +154,7 @@ class CaptureStore {
         });
 
         chrome.tabs.onRemoved.addListener((tabId: number) => {
-            delete this.activeChromeMap[tabId];
+            this.markTabAsGhost(tabId);
             this.save();
         });
 
@@ -133,6 +168,46 @@ class CaptureStore {
         });
     }
 
+    private markWindowAsGhost(chromeWindowId: number) {
+        const windowId = this.activeChromeMap[chromeWindowId];
+        if (!windowId) return;
+
+        const windowItem = this.items[windowId] as MetaItem<BrowserWindowPayload> | undefined;
+        if (windowItem) {
+            // Soft deletion: Mark as ghost, keep all data
+            windowItem.data.chromeId = undefined;
+            windowItem.data.isOpen = false;
+
+            // Mark all child tabs as ghost too
+            const windowPayload = windowItem.data;
+            windowPayload.tabs.forEach(tabId => {
+                const tabItem = this.items[tabId] as MetaItem<BrowserTabPayload> | undefined;
+                if (tabItem) {
+                    tabItem.data.chromeId = undefined;
+                    tabItem.data.isOpen = false;
+                }
+            });
+        }
+
+        // Remove from activeChromeMap
+        delete this.activeChromeMap[chromeWindowId];
+    }
+
+    private markTabAsGhost(chromeTabId: number) {
+        const tabId = this.activeChromeMap[chromeTabId];
+        if (!tabId) return;
+
+        const tabItem = this.items[tabId] as MetaItem<BrowserTabPayload> | undefined;
+        if (tabItem) {
+            // Soft deletion: Mark as ghost, keep all data (url, title, favIconUrl)
+            tabItem.data.chromeId = undefined;
+            tabItem.data.isOpen = false;
+        }
+
+        // Remove from activeChromeMap
+        delete this.activeChromeMap[chromeTabId];
+    }
+
     private upsertWindow(win: chrome.windows.Window) {
         if (win.id === undefined) return;
 
@@ -141,7 +216,10 @@ class CaptureStore {
 
         // If mapped UUID exists, verify the MetaItem exists (robustness check)
         if (windowId && this.items[windowId]) {
-            // Window already exists, just update tabs
+            // Window already exists, reactivate it (was ghost, now active again)
+            const windowItem = this.items[windowId] as MetaItem<BrowserWindowPayload>;
+            windowItem.data.chromeId = win.id;
+            windowItem.data.isOpen = true;
             this.activeChromeMap[win.id] = windowId;
             win.tabs?.forEach((tab: chrome.tabs.Tab) => this.upsertTab(tab, windowId));
             return;
@@ -153,7 +231,12 @@ class CaptureStore {
             id: windowId,
             definitionId: DEFINITIONS.BROWSER_WINDOW,
             createdAt: Date.now(),
-            data: { name: `Window ${win.id}`, tabs: [] } as BrowserWindowPayload
+            data: {
+                name: `Window ${win.id}`,
+                tabs: [],
+                chromeId: win.id,
+                isOpen: true
+            } as BrowserWindowPayload
         };
 
         // Add to session's windows array only if not already present
@@ -185,18 +268,23 @@ class CaptureStore {
                     url: tab.url,
                     title: tab.title,
                     favIconUrl: tab.favIconUrl,
-                    isPinned: tab.pinned
+                    isPinned: tab.pinned,
+                    chromeId: tab.id,
+                    isOpen: true
                 }
             };
             this.items[tabId] = tabItem;
             const windowPayload = this.items[winId].data as BrowserWindowPayload;
             if (!windowPayload.tabs.includes(tabId)) windowPayload.tabs.push(tabId);
         } else {
+            // Tab exists (possibly was ghost), reactivate it
             Object.assign(tabItem.data, {
                 url: tab.url,
                 title: tab.title,
                 favIconUrl: tab.favIconUrl,
-                isPinned: tab.pinned
+                isPinned: tab.pinned,
+                chromeId: tab.id,
+                isOpen: true
             });
             this.ensureTabInWindow(tabId, winId);
         }
@@ -228,6 +316,11 @@ class CaptureStore {
             rootSessionId: this.rootSessionId,
             activeChromeMap: $state.snapshot(this.activeChromeMap)
         });
+    }
+
+    get visibleItems() {
+        // Returns all items (Active + Ghost) for search/filtering
+        return Object.values(this.items);
     }
 
     async clearStorage() {
