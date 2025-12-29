@@ -37,6 +37,9 @@ You are an expert Senior Frontend Engineer specializing in **Svelte 5 (Runes)**,
   - ❌ `import { storage } from "wxt/storage";`
 - **Permissions:** If using a new API (e.g., `chrome.bookmarks`), verify `wxt.config.ts` permissions first.
 
+- **Entrypoint Structure:** The main UI lives in `src/entrypoints/app` (NOT `popup`). This is intentional to prevent WXT from registering a `default_popup` in the manifest.
+- **Launch Behavior:** The extension MUST launch via `chrome.action.onClicked` in `background.ts`, creating a `type: 'popup'` window. Never revert to a standard extension popup.
+
 ## 4. Metabrain Data Schema
 *** REFERENCES - METABRAIN_SCHEMA.md ***
 - **Structure:** "Objects of Objects." Do not use nested trees. Use flat lists of Items linked by UUIDs.
@@ -75,3 +78,4 @@ You are an expert Senior Frontend Engineer specializing in **Svelte 5 (Runes)**,
 - **Be Terse:** Do not lecture. Just write the code.
 - **Full Outputs:** Output the full file content so it can be copy-pasted. Do not use `// ... existing code`.
 - **Validation:** Before outputting, check: Did I import a rune? (Don't). Did I use @apply? (Don't). Did I use `#imports`? (Yes).
+

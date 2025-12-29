@@ -59,7 +59,7 @@ The Popup is too transient. We need a permanent workspace.
 
 - If Yes: Focus it.
     
-- If No: chrome.windows.create({ type: 'popup', url: 'popup.html', ... }).
+- If No: chrome.windows.create({ type: 'popup', url: 'app.html', ... }).
     
 
 **Resize:** Ensure it launches with vertical dimensions (e.g., 450x900).
