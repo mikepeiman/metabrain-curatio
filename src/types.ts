@@ -7,7 +7,13 @@ export interface BrowserTabPayload {
   isPinned?: boolean;
   chromeId?: number; // Chrome tab ID (undefined when ghost)
   isOpen?: boolean; // true when active in Chrome, false when ghost
-  children?: UUID[]; // Child tabs (for grouping/nesting)
+  /**
+   * Semantic nesting only: does NOT affect Chrome tab order.
+   * Points to the UUID of either a window or another tab.
+   */
+  outlineParentId?: UUID;
+  // Legacy (pre-refactor) nesting representation; migrated to outlineParentId.
+  children?: UUID[];
   status?: 'active' | 'closed' | 'archived'; // Item state: active (visible), closed (ghost), archived (hidden)
 }
 

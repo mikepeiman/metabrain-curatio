@@ -24,7 +24,10 @@ export default defineBackground(() => {
   chrome.tabs.onMoved.addListener(() => { reconcile().catch(console.error); });
   chrome.tabs.onAttached.addListener(() => { reconcile().catch(console.error); });
   chrome.tabs.onDetached.addListener(() => { reconcile().catch(console.error); });
-  chrome.tabs.onRemoved.addListener(() => { reconcile().catch(console.error); });
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    ensureInit().then(() => captureStore.handleChromeTabRemoved(tabId)).catch(console.error);
+    reconcile().catch(console.error);
+  });
   chrome.windows.onCreated.addListener(() => { reconcile().catch(console.error); });
   chrome.windows.onRemoved.addListener(() => { reconcile().catch(console.error); });
 

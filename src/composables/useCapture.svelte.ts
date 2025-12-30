@@ -23,6 +23,8 @@ class CaptureStore {
     private isBackground = false;
     private storageListener: ((changes: { [key: string]: chrome.storage.StorageChange }, areaName: string) => void) | null = null;
     private reconcilePromise: Promise<void> | null = null;
+    // Track intentional sleeps so we don't treat them like external closes.
+    private intentionalSleepTabIds = new Set<number>();
 
     async init(isBackground: boolean = false) {
         this.isBackground = isBackground;
@@ -54,6 +56,25 @@ class CaptureStore {
             this.activeChromeWindowMap = {};
             this.activeChromeTabMap = {};
             await this.save();
+        }
+        // One-time migration for legacy children arrays -> outlineParentId.
+        this.migrateLegacyChildrenToOutlineParents();
+    }
+
+    private migrateLegacyChildrenToOutlineParents() {
+        for (const [id, item] of Object.entries(this.items)) {
+            if (item.definitionId !== DEFINITIONS.BROWSER_TAB) continue;
+            const payload = item.data as BrowserTabPayload;
+            const legacyChildren = payload.children || [];
+            for (const childId of legacyChildren) {
+                const child = this.items[childId];
+                if (!child || child.definitionId !== DEFINITIONS.BROWSER_TAB) continue;
+                const childPayload = child.data as BrowserTabPayload;
+                if (!childPayload.outlineParentId) {
+                    childPayload.outlineParentId = id;
+                }
+            }
+            // Keep legacy array for now, but it is ignored by rendering/order logic.
         }
     }
 
@@ -130,6 +151,39 @@ class CaptureStore {
     }
 
     /**
+     * Called from background tab removal event.
+     * - If the tab was intentionally slept from Curatio, mark as closed but keep in UI.
+     * - Otherwise (user closed in Chrome), archive it (hidden from UI) but keep in DB/history.
+     */
+    async handleChromeTabRemoved(chromeTabId: number) {
+        const tabUuid = this.activeChromeTabMap[chromeTabId] ?? this.findTabByChromeId(chromeTabId);
+        if (!tabUuid) return;
+
+        const item = this.items[tabUuid];
+        if (!item || item.definitionId !== DEFINITIONS.BROWSER_TAB) return;
+        const payload = item.data as BrowserTabPayload;
+
+        payload.chromeId = undefined;
+        payload.isOpen = false;
+
+        // If we already marked this tab closed before removal, treat it as a sleep.
+        // This avoids relying on ephemeral in-memory tracking across MV3 service worker lifecycles.
+        const wasAlreadyClosed = payload.status === 'closed' || payload.isOpen === false;
+
+        if (wasAlreadyClosed || this.intentionalSleepTabIds.has(chromeTabId)) {
+            payload.status = 'closed';
+            this.intentionalSleepTabIds.delete(chromeTabId);
+        } else {
+            // External close => archive (remove from UI, keep in DB)
+            payload.status = 'archived';
+        }
+
+        delete this.activeChromeTabMap[chromeTabId];
+        this.items = { ...this.items };
+        await this.save();
+    }
+
+    /**
      * Sync tab order from Chrome to Curatio data structure.
      * Ensures the order in our arrays matches the actual Chrome tab order.
      */
@@ -161,11 +215,22 @@ class CaptureStore {
                 }
             }
             
-            // Update window tabs array to match Chrome order
-            // Preserve any tabs that aren't in Chrome (ghost tabs) at the end
+            // Reorder ONLY active tabs to match Chrome, while keeping closed/archived tabs in-place.
+            // This prevents sleeping/closed tabs from jumping to the end.
             const existingTabs = windowPayload.tabs || [];
-            const ghostTabs = existingTabs.filter(id => !seenTabIds.has(id));
-            windowPayload.tabs = [...orderedTabIds, ...ghostTabs];
+            const rank = new Map<UUID, number>();
+            orderedTabIds.forEach((id, idx) => rank.set(id, idx));
+
+            const activeInExisting = existingTabs.filter(id => rank.has(id));
+            activeInExisting.sort((a, b) => (rank.get(a)! - rank.get(b)!));
+
+            let activeCursor = 0;
+            windowPayload.tabs = existingTabs.map(id => {
+                if (!rank.has(id)) return id;
+                const next = activeInExisting[activeCursor];
+                activeCursor++;
+                return next;
+            });
         }
     }
 
@@ -184,15 +249,15 @@ class CaptureStore {
             if (payload.isOpen && payload.chromeId !== undefined) {
                 // SLEEP: Close tab, keep node
                 const chromeTabId = payload.chromeId;
+                // Mark closed immediately for UI, but keep chromeId until onRemoved so we can classify correctly.
+                payload.isOpen = false;
+                payload.status = 'closed';
+                this.items = { ...this.items };
+                this.intentionalSleepTabIds.add(chromeTabId);
                 try {
                     await chrome.tabs.remove(chromeTabId);
                 } catch (e) { /* ignore if already gone */ }
-                // Mark as ghost immediately
-                payload.isOpen = false;
-                payload.chromeId = undefined;
-                payload.status = 'closed';
-                delete this.activeChromeTabMap[chromeTabId];
-                this.items = { ...this.items };
+                // Final cleanup happens in `handleChromeTabRemoved`.
             } else if (payload.url) {
                 // Find nearest ancestor window (supports nested/indented tabs)
                 const ancestorWindow = this.findAncestorWindow(id);
@@ -201,7 +266,7 @@ class CaptureStore {
                 const parentItem = this.items[ancestorWindow.windowId];
                 if (!parentItem || parentItem.definitionId !== DEFINITIONS.BROWSER_WINDOW) return;
 
-                // Ensure tab is listed under the window
+                // Ensure tab is listed under the window (flattened order)
                 await this.ensureTabInWindow(id, ancestorWindow.windowId);
 
                 let windowChromeId = (parentItem.data as BrowserWindowPayload).chromeId;
@@ -273,6 +338,18 @@ class CaptureStore {
         const item = this.items[id];
         const parentId = this.findParent(id);
         if (!item || !parentId) return;
+
+        // Semantic outdent for tab nested under a tab: set its outlineParentId to the containing window.
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB && this.items[parentId]?.definitionId === DEFINITIONS.BROWSER_TAB) {
+            const windowId = this.findContainingWindowForTab(id);
+            if (windowId) {
+                (item.data as BrowserTabPayload).outlineParentId = windowId;
+                this.items = { ...this.items };
+                await this.save();
+                this.setFocus(id);
+                return;
+            }
+        }
 
         // Special Case: Detach Tab into New Window
         if (item.definitionId === DEFINITIONS.BROWSER_TAB && this.items[parentId]?.definitionId === DEFINITIONS.BROWSER_WINDOW) {
@@ -349,28 +426,9 @@ class CaptureStore {
                 await this.moveChromeTree(id, newWindowChromeId, idx + 1);
             }
         } else if (gp.definitionId === DEFINITIONS.BROWSER_TAB) {
-            // Tab outdenting from Tab: become sibling of parent Tab in grandparent Tab's children
-            const pl = gp.data as BrowserTabPayload;
-            if (!pl.children) {
-                pl.children = [];
-            }
-            if (!pl.children.includes(id)) {
-                const idx = pl.children.indexOf(parentId);
-                if (idx >= 0) {
-                    pl.children.splice(idx + 1, 0, id);
-                } else {
-                    pl.children.push(id);
-                }
-            }
-
-            // Move Chrome tab to parent tab's window
-            if (item.definitionId === DEFINITIONS.BROWSER_TAB && pl.chromeId !== undefined) {
-                const tabPayload = item.data as BrowserTabPayload;
-                chrome.tabs.get(pl.chromeId).then(async parentTab => {
-                    if (tabPayload.chromeId !== undefined && parentTab?.windowId !== undefined) {
-                        await this.moveChromeTree(id, parentTab.windowId, -1);
-                    }
-                }).catch(console.error);
+            // Legacy path: treat as semantic sibling under the grandparent tab.
+            if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+                (item.data as BrowserTabPayload).outlineParentId = grandparentId;
             }
         }
         this.checkAndDeleteEmptyContainers(parentId);
@@ -401,61 +459,14 @@ class CaptureStore {
             ? (oldParent.data as BrowserWindowPayload).chromeId
             : undefined;
 
-        // Calculate target position BEFORE removing from parent
-        let targetIndex = -1;
-        if (prevSibling.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-            const newWindowPayload = prevSibling.data as BrowserWindowPayload;
-            // Insert after the last tab in the previous sibling window
-            targetIndex = newWindowPayload.tabs.length;
-        } else if (prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
-            const tabPayload = prevSibling.data as BrowserTabPayload;
-            if (!tabPayload.children) {
-                tabPayload.children = [];
-            }
-            // Insert after the last child of the previous sibling tab
-            targetIndex = tabPayload.children.length;
-        }
-
-        this.removeFromParent(id, parentId);
-
-        if (prevSibling.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-            const newWindowPayload = prevSibling.data as BrowserWindowPayload;
-            if (!newWindowPayload.tabs.includes(id)) {
-                newWindowPayload.tabs.splice(targetIndex, 0, id);
-            }
-            // Move Chrome tab(s) to new window if both are active (recursively)
-            const newWindowChromeId = newWindowPayload.chromeId;
-            if (newWindowChromeId !== undefined) {
-                // Calculate Chrome tab index: find position after last tab in target window
-                const targetChromeIndex = await this.calculateChromeTabIndex(newWindowChromeId, targetIndex);
-                await this.moveChromeTree(id, newWindowChromeId, targetChromeIndex);
-            }
-        } else if (prevSibling.definitionId === DEFINITIONS.SESSION) {
-            const sessionWindows = (prevSibling.data as SavedSessionPayload).windows;
-            if (!sessionWindows.includes(id)) {
-                sessionWindows.push(id);
-            }
-        } else if (prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
-            // Tab-into-Tab nesting: initialize children array if missing
-            const tabPayload = prevSibling.data as BrowserTabPayload;
-            if (!tabPayload.children) {
-                tabPayload.children = [];
-            }
-            if (!tabPayload.children.includes(id)) {
-                tabPayload.children.splice(targetIndex, 0, id);
-            }
-            // Move Chrome tab to the parent tab's window if both are active
-            if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
-                const childTabPayload = item.data as BrowserTabPayload;
-                if (tabPayload.chromeId !== undefined && childTabPayload.chromeId !== undefined) {
-                    const parentTab = await chrome.tabs.get(tabPayload.chromeId);
-                    if (parentTab?.windowId !== undefined) {
-                        // Calculate Chrome tab index after parent tab
-                        const targetChromeIndex = await this.calculateChromeTabIndex(parentTab.windowId, parentTab.index + 1);
-                        await this.moveChromeTree(id, parentTab.windowId, targetChromeIndex);
-                    }
-                }
-            }
+        // Semantic indent: does NOT change Chrome order or window flat list.
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB && prevSibling.definitionId === DEFINITIONS.BROWSER_TAB) {
+            const child = item.data as BrowserTabPayload;
+            child.outlineParentId = prevSiblingId;
+            this.items = { ...this.items };
+            await this.save();
+            this.setFocus(id);
+            return;
         }
 
         this.checkAndDeleteEmptyContainers(parentId);
@@ -475,32 +486,13 @@ class CaptureStore {
         const tabsToMove = this.flattenActiveTabs(nodeId);
         if (tabsToMove.length === 0) return 0;
 
-        // Move all tabs together as a block
-        // When moving multiple tabs, we need to move in reverse order (last first) 
-        // because each move shifts subsequent tabs to the right
-        if (targetIndex < 0) {
-            // Move to end - move in forward order (parent first) since we're appending
-            for (let i = 0; i < tabsToMove.length; i++) {
-                const chromeId = tabsToMove[i];
-                try {
-                    await chrome.tabs.move(chromeId, { windowId: targetWindowId, index: -1 });
-                } catch (e) {
-                    console.error(`Failed to move tab ${chromeId}:`, e);
-                }
-            }
-        } else {
-            // Move to specific index - move in reverse order (last tab first)
-            // This ensures parent ends up at targetIndex and children follow sequentially
-            const count = tabsToMove.length;
-            for (let i = count - 1; i >= 0; i--) {
-                const chromeId = tabsToMove[i];
-                try {
-                    // Last tab goes to targetIndex + (count - 1), first tab goes to targetIndex
-                    await chrome.tabs.move(chromeId, { windowId: targetWindowId, index: targetIndex + i });
-                } catch (e) {
-                    console.error(`Failed to move tab ${chromeId}:`, e);
-                }
-            }
+        // Move as a single block to preserve adjacency (prevents "interstitial tab" glitches).
+        // Chrome supports moving an array of tabs while preserving their relative order.
+        const index = targetIndex < 0 ? 999999 : targetIndex;
+        try {
+            await chrome.tabs.move(tabsToMove, { windowId: targetWindowId, index });
+        } catch (e) {
+            console.error(`Failed to move tab block ${tabsToMove.join(',')}:`, e);
         }
         return tabsToMove.length;
     }
@@ -710,6 +702,18 @@ class CaptureStore {
             await this.ensureTabInWindow(tabId, winId);
         }
 
+        // If Chrome provides openerTabId (ctrl-click), set semantic nesting automatically.
+        if (tab.openerTabId !== undefined) {
+            const openerUuid =
+                this.activeChromeTabMap[tab.openerTabId] ?? this.findTabByChromeId(tab.openerTabId) ?? null;
+            if (openerUuid) {
+                const pl = (this.items[tabId].data as BrowserTabPayload);
+                if (!pl.outlineParentId) {
+                    pl.outlineParentId = openerUuid;
+                }
+            }
+        }
+
         // Always update the Chrome ID mapping
         this.activeChromeTabMap[tab.id] = tabId;
 
@@ -725,13 +729,6 @@ class CaptureStore {
             tabItem.data.chromeId = undefined;
             tabItem.data.isOpen = false;
             tabItem.data.status = 'closed';
-
-            // Remove from parent immediately (archive and remove from UI)
-            const parentId = this.findParent(tabId);
-            if (parentId) {
-                this.removeFromParent(tabId, parentId);
-                this.checkAndDeleteEmptyContainers(parentId);
-            }
         }
         delete this.activeChromeTabMap[chromeTabId];
         // Trigger reactivity by updating state
@@ -796,16 +793,12 @@ class CaptureStore {
             if (!this.isAppTab(chromeWindow.tabs[i].url)) nonAppIndex++;
         }
         
-        // Remove tab from all windows and tab children arrays to prevent duplicates
+        // Remove tab from all OTHER windows to prevent duplicates.
+        // NOTE: Do NOT touch semantic nesting (outlineParentId) here.
         Object.values(this.items).forEach(item => {
             if (item.definitionId === DEFINITIONS.BROWSER_WINDOW && item.id !== windowId) {
                 const pl = item.data as BrowserWindowPayload;
                 pl.tabs = pl.tabs.filter(id => id !== tabId);
-            } else if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
-                const tabPayload = item.data as BrowserTabPayload;
-                if (tabPayload.children) {
-                    tabPayload.children = tabPayload.children.filter(id => id !== tabId);
-                }
             }
         });
         
@@ -853,6 +846,15 @@ class CaptureStore {
         return null;
     }
 
+    private findContainingWindowForTab(tabId: UUID): UUID | null {
+        for (const [id, item] of Object.entries(this.items)) {
+            if (item.definitionId !== DEFINITIONS.BROWSER_WINDOW) continue;
+            const pl = item.data as BrowserWindowPayload;
+            if (pl.tabs?.includes(tabId)) return id;
+        }
+        return null;
+    }
+
     private removeFromParent(childId: UUID, parentId: UUID) {
         const parent = this.items[parentId];
         if (parent) {
@@ -864,8 +866,13 @@ class CaptureStore {
                 pl.tabs = pl.tabs.filter(id => id !== childId);
             } else if (parent.definitionId === DEFINITIONS.BROWSER_TAB) {
                 const pl = parent.data as BrowserTabPayload;
-                if (pl.children) {
-                    pl.children = pl.children.filter(id => id !== childId);
+                // Semantic nesting: clear outlineParentId on the child if it was pointing to this tab.
+                const child = this.items[childId];
+                if (child?.definitionId === DEFINITIONS.BROWSER_TAB) {
+                    const childPayload = child.data as BrowserTabPayload;
+                    if (childPayload.outlineParentId === parentId) {
+                        childPayload.outlineParentId = undefined;
+                    }
                 }
             }
         }
@@ -895,10 +902,34 @@ class CaptureStore {
             return filterArchived((item.data as SavedSessionPayload).windows || []);
         }
         if (item.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-            return filterArchived((item.data as BrowserWindowPayload).tabs || []);
+            const windowId = id;
+            const ordered = (item.data as BrowserWindowPayload).tabs || [];
+            // Direct children are those whose outlineParentId points to this window (or is unset).
+            return filterArchived(
+                ordered.filter(tabId => {
+                    const t = this.items[tabId];
+                    if (!t || t.definitionId !== DEFINITIONS.BROWSER_TAB) return false;
+                    const pl = t.data as BrowserTabPayload;
+                    return pl.outlineParentId === windowId || pl.outlineParentId === undefined;
+                })
+            );
         }
         if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
-            return filterArchived((item.data as BrowserTabPayload).children || []);
+            const parentTabId = id;
+            const windowId = this.findContainingWindowForTab(parentTabId);
+            if (!windowId) return [];
+            const window = this.items[windowId];
+            if (!window || window.definitionId !== DEFINITIONS.BROWSER_WINDOW) return [];
+            const ordered = (window.data as BrowserWindowPayload).tabs || [];
+            // Children are tabs whose outlineParentId points to this tab, preserving the window's flat order.
+            return filterArchived(
+                ordered.filter(tabId => {
+                    const t = this.items[tabId];
+                    if (!t || t.definitionId !== DEFINITIONS.BROWSER_TAB) return false;
+                    const pl = t.data as BrowserTabPayload;
+                    return pl.outlineParentId === parentTabId;
+                })
+            );
         }
         return [];
     }
@@ -955,155 +986,153 @@ class CaptureStore {
 
     async moveNode(id: UUID, direction: 'up' | 'down') {
         const item = this.items[id];
-        const parentId = this.findParent(id);
-        if (!item || !parentId) return;
+        if (!item) return;
 
+        // Tabs: move within the containing window's flat order, but move the whole semantic subtree as a contiguous block.
+        if (item.definitionId === DEFINITIONS.BROWSER_TAB) {
+            const windowId = this.findContainingWindowForTab(id);
+            if (!windowId) return;
+            const windowItem = this.items[windowId];
+            if (!windowItem || windowItem.definitionId !== DEFINITIONS.BROWSER_WINDOW) return;
+
+            const windowPayload = windowItem.data as BrowserWindowPayload;
+            const flat = windowPayload.tabs || [];
+
+            const blockIds: UUID[] = [];
+            const collect = (nodeId: UUID) => {
+                blockIds.push(nodeId);
+                for (const childId of this.getChildren(nodeId)) {
+                    collect(childId);
+                }
+            };
+            collect(id);
+
+            const blockSet = new Set(blockIds);
+            const indices = blockIds.map(tid => flat.indexOf(tid)).filter(i => i >= 0);
+            if (indices.length === 0) return;
+            const start = Math.min(...indices);
+            const end = Math.max(...indices);
+
+            // Build the new flat list by removing the block
+            const without = flat.filter(tid => !blockSet.has(tid));
+
+            const session = this.items[this.rootSessionId]?.data as SavedSessionPayload | undefined;
+            const windowOrder = session?.windows || [];
+            const windowIndex = windowOrder.indexOf(windowId);
+
+            const insertIntoWindow = async (targetWindowId: UUID, insertAt: number) => {
+                const targetWindow = this.items[targetWindowId];
+                if (!targetWindow || targetWindow.definitionId !== DEFINITIONS.BROWSER_WINDOW) return false;
+                const targetPayload = targetWindow.data as BrowserWindowPayload;
+
+                // Remove block from source window list
+                windowPayload.tabs = windowPayload.tabs.filter(tid => !blockSet.has(tid));
+                // Insert into target window list
+                const dest = targetPayload.tabs || [];
+                const clamped = Math.max(0, Math.min(insertAt, dest.length));
+                dest.splice(clamped, 0, ...blockIds);
+                targetPayload.tabs = dest;
+
+                // Move chrome if active
+                if (targetPayload.chromeId !== undefined) {
+                    const targetChromeIndex = await this.calculateChromeTabIndex(targetPayload.chromeId, clamped);
+                    await this.moveChromeTree(id, targetPayload.chromeId, targetChromeIndex);
+                }
+                return true;
+            };
+
+            if (direction === 'up') {
+                if (start === 0 && windowIndex > 0) {
+                    // Move to end of previous window
+                    const prevWinId = windowOrder[windowIndex - 1];
+                    const prevWin = this.items[prevWinId];
+                    const prevTabs = prevWin?.definitionId === DEFINITIONS.BROWSER_WINDOW ? (prevWin.data as BrowserWindowPayload).tabs : [];
+                    await insertIntoWindow(prevWinId, prevTabs.length);
+                } else {
+                    // Move block one slot left
+                    const insertAt = Math.max(0, start - 1);
+                    without.splice(insertAt, 0, ...blockIds);
+                    windowPayload.tabs = without;
+                    if (windowPayload.chromeId !== undefined) {
+                        const targetChromeIndex = await this.calculateChromeTabIndex(windowPayload.chromeId, insertAt);
+                        await this.moveChromeTree(id, windowPayload.chromeId, targetChromeIndex);
+                    }
+                }
+            } else {
+                if (end === flat.length - 1 && windowIndex >= 0 && windowIndex < windowOrder.length - 1) {
+                    // Move to start of next window
+                    const nextWinId = windowOrder[windowIndex + 1];
+                    const ok = await insertIntoWindow(nextWinId, 0);
+                    if (!ok) return;
+                } else if (end === flat.length - 1 && windowIndex === windowOrder.length - 1) {
+                    // At bottom of last window: spawn a new window and move block there.
+                    const firstChromeTabId = (this.items[id].data as BrowserTabPayload).chromeId;
+                    if (firstChromeTabId !== undefined) {
+                        const newWin = await chrome.windows.create({ tabId: firstChromeTabId });
+                        if (newWin?.id !== undefined) {
+                            const newWindowUuid = crypto.randomUUID();
+                            this.items[newWindowUuid] = {
+                                id: newWindowUuid,
+                                definitionId: DEFINITIONS.BROWSER_WINDOW,
+                                createdAt: Date.now(),
+                                data: {
+                                    name: `Window ${newWin.id}`,
+                                    tabs: [],
+                                    chromeId: newWin.id,
+                                    isOpen: true,
+                                    status: 'active'
+                                } as BrowserWindowPayload
+                            };
+                            const session = this.items[this.rootSessionId]?.data as SavedSessionPayload;
+                            if (session && !session.windows.includes(newWindowUuid)) {
+                                session.windows.push(newWindowUuid);
+                            }
+                            this.activeChromeWindowMap[newWin.id] = newWindowUuid;
+                            // Insert block into new window list at start (Chrome already moved one tab; move the rest as a block).
+                            windowPayload.tabs = windowPayload.tabs.filter(tid => !blockSet.has(tid));
+                            (this.items[newWindowUuid].data as BrowserWindowPayload).tabs.splice(0, 0, ...blockIds);
+                            await this.moveChromeTree(id, newWin.id, 0);
+                        }
+                    }
+                } else {
+                    // Move block one slot right (after the next item)
+                    const insertAt = Math.min(without.length, start + 1);
+                    without.splice(insertAt, 0, ...blockIds);
+                    windowPayload.tabs = without;
+                    if (windowPayload.chromeId !== undefined) {
+                        const targetChromeIndex = await this.calculateChromeTabIndex(windowPayload.chromeId, insertAt);
+                        await this.moveChromeTree(id, windowPayload.chromeId, targetChromeIndex);
+                    }
+                }
+            }
+
+            this.items = { ...this.items };
+            await this.save();
+            this.setFocus(id);
+            return;
+        }
+
+        // Windows: keep existing behavior for now
+        const parentId = this.findParent(id);
+        if (!parentId) return;
         const parent = this.items[parentId];
         if (!parent) return;
 
-        // Get old parent window chromeId for tab moves
-        const oldParentWindowId = parent.definitionId === DEFINITIONS.BROWSER_WINDOW
-            ? (parent.data as BrowserWindowPayload).chromeId
-            : undefined;
-
-        // Get the actual children array from parent data (not filtered)
         let siblings: UUID[] = [];
         if (parent.definitionId === DEFINITIONS.SESSION) {
             siblings = (parent.data as SavedSessionPayload).windows || [];
-        } else if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-            siblings = (parent.data as BrowserWindowPayload).tabs || [];
-        } else if (parent.definitionId === DEFINITIONS.BROWSER_TAB) {
-            siblings = (parent.data as BrowserTabPayload).children || [];
         }
-
         const index = siblings.indexOf(id);
         if (index < 0) return;
 
         const newIndex = direction === 'up' ? index - 1 : index + 1;
+        if (newIndex < 0 || newIndex >= siblings.length) return;
 
-        // If at boundary, try to move to adjacent parent
-        if (newIndex < 0 || newIndex >= siblings.length) {
-            const grandparentId = this.findParent(parentId);
-            if (!grandparentId) return; // Can't move beyond root
-
-            const grandparent = this.items[grandparentId];
-            if (!grandparent) return;
-
-            let grandparentSiblings: UUID[] = [];
-            if (grandparent.definitionId === DEFINITIONS.SESSION) {
-                grandparentSiblings = (grandparent.data as SavedSessionPayload).windows || [];
-            } else if (grandparent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-                grandparentSiblings = (grandparent.data as BrowserWindowPayload).tabs || [];
-            } else if (grandparent.definitionId === DEFINITIONS.BROWSER_TAB) {
-                grandparentSiblings = (grandparent.data as BrowserTabPayload).children || [];
-            }
-
-            const parentIndex = grandparentSiblings.indexOf(parentId);
-            if (parentIndex < 0) return;
-
-            if (direction === 'up' && index === 0 && parentIndex > 0) {
-                // Move to end of previous sibling
-                const prevParentId = grandparentSiblings[parentIndex - 1];
-                this.removeFromParent(id, parentId);
-                // Immediately check old parent for cleanup
-                this.checkAndDeleteEmptyContainers(parentId);
-                const prevParent = this.items[prevParentId];
-                if (prevParent) {
-                    if (prevParent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-                        const tabsArray = (prevParent.data as BrowserWindowPayload).tabs;
-                        if (!tabsArray.includes(id)) tabsArray.push(id);
-                        // Move Chrome tab(s) to new window (recursively - always use moveChromeTree to keep parent+children together)
-                        const newWindowChromeId = (prevParent.data as BrowserWindowPayload).chromeId;
-                        if (newWindowChromeId !== undefined) {
-                            // Always use moveChromeTree to move node and all descendants together
-                            await this.moveChromeTree(id, newWindowChromeId, -1);
-                        }
-                    } else if (prevParent.definitionId === DEFINITIONS.BROWSER_TAB) {
-                        const tabPayload = prevParent.data as BrowserTabPayload;
-                        if (!tabPayload.children) tabPayload.children = [];
-                        if (!tabPayload.children.includes(id)) tabPayload.children.push(id);
-                        // Move Chrome tab to parent tab's window (always use moveChromeTree to keep parent+children together)
-                        if (item.definitionId === DEFINITIONS.BROWSER_TAB && tabPayload.chromeId !== undefined) {
-                            const parentTab = await chrome.tabs.get(tabPayload.chromeId);
-                            if (parentTab?.windowId !== undefined) {
-                                // Always use moveChromeTree to move node and all descendants together
-                                await this.moveChromeTree(id, parentTab.windowId, -1);
-                            }
-                        }
-                    } else if (prevParent.definitionId === DEFINITIONS.SESSION) {
-                        const windowsArray = (prevParent.data as SavedSessionPayload).windows;
-                        if (!windowsArray.includes(id)) windowsArray.push(id);
-                    }
-                }
-                this.items = { ...this.items }; // Trigger reactivity
-                this.save();
-                this.setFocus(id);
-                return;
-            } else if (direction === 'down' && index === siblings.length - 1 && parentIndex < grandparentSiblings.length - 1) {
-                // Move to start of next sibling
-                const nextParentId = grandparentSiblings[parentIndex + 1];
-                this.removeFromParent(id, parentId);
-                // Immediately check old parent for cleanup
-                this.checkAndDeleteEmptyContainers(parentId);
-                const nextParent = this.items[nextParentId];
-                if (nextParent) {
-                    if (nextParent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-                        const tabsArray = (nextParent.data as BrowserWindowPayload).tabs;
-                        if (!tabsArray.includes(id)) tabsArray.unshift(id);
-                        // Move Chrome tab(s) to new window (recursively - always use moveChromeTree to keep parent+children together)
-                        const newWindowChromeId = (nextParent.data as BrowserWindowPayload).chromeId;
-                        if (newWindowChromeId !== undefined) {
-                            // Always use moveChromeTree to move node and all descendants together
-                            await this.moveChromeTree(id, newWindowChromeId, 0);
-                        }
-                    } else if (nextParent.definitionId === DEFINITIONS.BROWSER_TAB) {
-                        const tabPayload = nextParent.data as BrowserTabPayload;
-                        if (!tabPayload.children) tabPayload.children = [];
-                        if (!tabPayload.children.includes(id)) tabPayload.children.unshift(id);
-                        // Move Chrome tab to parent tab's window (always use moveChromeTree to keep parent+children together)
-                        if (item.definitionId === DEFINITIONS.BROWSER_TAB && tabPayload.chromeId !== undefined) {
-                            const parentTab = await chrome.tabs.get(tabPayload.chromeId);
-                            if (parentTab?.windowId !== undefined) {
-                                // Always use moveChromeTree to move node and all descendants together
-                                await this.moveChromeTree(id, parentTab.windowId, 0);
-                            }
-                        }
-                    } else if (nextParent.definitionId === DEFINITIONS.SESSION) {
-                        const windowsArray = (nextParent.data as SavedSessionPayload).windows;
-                        if (!windowsArray.includes(id)) windowsArray.unshift(id);
-                    }
-                }
-                this.items = { ...this.items }; // Trigger reactivity
-                this.save();
-                this.setFocus(id);
-                return;
-            }
-            return; // Can't move beyond boundaries
-        }
-
-        // Normal swap within siblings - modify the actual array
-        // Remove the item from its current position
         siblings.splice(index, 1);
-        // Insert at new position (accounting for removal)
-        // Moving up/down by one is equivalent to inserting at the neighbor index.
-        // Using `newIndex - 1` breaks "move down" (becomes a no-op).
-        const insertIndex = newIndex;
-        siblings.splice(insertIndex, 0, id);
+        siblings.splice(newIndex, 0, id);
 
-        // Sync with Chrome if parent is a window and items are tabs
-        if (parent.definitionId === DEFINITIONS.BROWSER_WINDOW) {
-            const parentWindowChromeId = (parent.data as BrowserWindowPayload).chromeId;
-            if (parentWindowChromeId !== undefined) {
-                // Calculate the correct Chrome tab index for the new position
-                const targetChromeIndex = await this.calculateChromeTabIndex(parentWindowChromeId, insertIndex);
-                // Move full subtree to preserve child ordering (moves parent + all children together)
-                await this.moveChromeTree(id, parentWindowChromeId, targetChromeIndex);
-            }
-        }
-
-        this.items = { ...this.items }; // Trigger reactivity
-        this.save();
-        // Maintain focus after operation
+        this.items = { ...this.items };
+        await this.save();
         this.setFocus(id);
     }
 
