@@ -22,9 +22,9 @@
   const isFocused = $derived(captureStore.focusedNodeId === id);
   const isSelected = $derived(captureStore.selectedNodeIds.has(id));
 
-  const isActive = $derived(
-    item?.data.isOpen === true && item?.data.chromeId !== undefined
-  );
+  // Treat "isOpen" as the source of truth for active styling.
+  // chromeId can lag briefly during wake (create) operations.
+  const isActive = $derived(item?.data.isOpen === true);
 
   const displayName = $derived.by(() => {
     if (!item) return "";

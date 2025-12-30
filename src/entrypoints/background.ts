@@ -1,7 +1,35 @@
 import { captureStore } from '@/composables/useCapture.svelte';
 
 export default defineBackground(() => {
-  captureStore.init(true).catch(console.error);
+  let initPromise: Promise<void> | null = null;
+  const ensureInit = async () => {
+    if (!initPromise) {
+      initPromise = captureStore.init(true).catch((e) => {
+        initPromise = null;
+        throw e;
+      });
+    }
+    await initPromise;
+  };
+
+  // MV3 Service Worker requirement:
+  // Register listeners synchronously so events wake the worker and are handled in realtime.
+  const reconcile = async () => {
+    await ensureInit();
+    await captureStore.reconcileFromChrome();
+  };
+
+  chrome.tabs.onCreated.addListener(() => { reconcile().catch(console.error); });
+  chrome.tabs.onUpdated.addListener(() => { reconcile().catch(console.error); });
+  chrome.tabs.onMoved.addListener(() => { reconcile().catch(console.error); });
+  chrome.tabs.onAttached.addListener(() => { reconcile().catch(console.error); });
+  chrome.tabs.onDetached.addListener(() => { reconcile().catch(console.error); });
+  chrome.tabs.onRemoved.addListener(() => { reconcile().catch(console.error); });
+  chrome.windows.onCreated.addListener(() => { reconcile().catch(console.error); });
+  chrome.windows.onRemoved.addListener(() => { reconcile().catch(console.error); });
+
+  // Kick initial reconcile
+  reconcile().catch(console.error);
 
   // Store the Curatio window ID in session storage
   const CURATIO_WINDOW_KEY = 'curatio_window_id';
@@ -107,7 +135,6 @@ export default defineBackground(() => {
     if (message.type === 'SAVE_STATE') {
       captureStore.items = message.data.items;
       captureStore.rootSessionId = message.data.rootSessionId;
-      captureStore.activeChromeMap = message.data.activeChromeMap;
       captureStore.save().then(() => {
         sendResponse({ success: true });
       }).catch((err) => {

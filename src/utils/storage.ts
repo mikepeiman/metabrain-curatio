@@ -4,7 +4,6 @@ import type { MetaItem, UUID } from '../types';
 export interface MetabrainData {
     items: Record<UUID, MetaItem>;
     rootSessionId: UUID;
-    activeChromeMap: Record<number, UUID>;
 }
 
 const STORAGE_KEY = 'local:metabrain_data';
