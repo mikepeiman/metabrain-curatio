@@ -60,8 +60,13 @@ class CaptureStore {
     private setupStorageListener() {
         if (this.storageListener) chrome.storage.onChanged.removeListener(this.storageListener);
         this.storageListener = (changes, areaName) => {
-            if (areaName === 'local' && changes['local:metabrain_data']) {
-                const newValue = changes['local:metabrain_data'].newValue as MetabrainData | undefined;
+            // WXT `storage.setItem('local:KEY', ...)` may surface in `chrome.storage.onChanged`
+            // either as `KEY` (most common) or `local:KEY` depending on implementation.
+            const change =
+                (areaName === 'local' ? (changes['metabrain_data'] ?? changes['local:metabrain_data']) : undefined);
+
+            if (change) {
+                const newValue = change.newValue as MetabrainData | undefined;
                 if (newValue) {
                     this.items = newValue.items;
                     this.rootSessionId = newValue.rootSessionId;
@@ -508,18 +513,18 @@ class CaptureStore {
         const chromeWindow = await chrome.windows.get(windowChromeId, { populate: true });
         if (!chromeWindow.tabs) return -1;
 
-        // Count active tabs up to logicalIndex
-        let activeCount = 0;
-        for (let i = 0; i < chromeWindow.tabs.length && activeCount < logicalIndex; i++) {
-            const tab = chromeWindow.tabs[i];
-            if (tab.id && this.activeChromeTabMap[tab.id] && !this.isAppTab(tab.url)) {
-                activeCount++;
-            }
+        // We define logicalIndex as the position among non-app tabs (Curatio's UI list).
+        // Convert that to an actual Chrome `index` while skipping the app tab.
+        let seen = 0;
+        for (let chromeIndex = 0; chromeIndex < chromeWindow.tabs.length; chromeIndex++) {
+            const tab = chromeWindow.tabs[chromeIndex];
+            if (this.isAppTab(tab.url)) continue;
+            if (seen === logicalIndex) return chromeIndex;
+            seen++;
         }
 
-        // Return the Chrome tab index (or -1 for end)
-        if (activeCount >= chromeWindow.tabs.length) return -1;
-        return activeCount;
+        // If logicalIndex is past the end of the non-app tabs, append.
+        return -1;
     }
 
     /**
@@ -677,8 +682,13 @@ class CaptureStore {
                 const chromeWindow = await chrome.windows.get(tab.windowId!, { populate: true });
                 if (chromeWindow.tabs) {
                     const chromeTabIndex = chromeWindow.tabs.findIndex(t => t.id === tab.id);
-                    if (chromeTabIndex >= 0 && chromeTabIndex < windowTabs.length) {
-                        windowTabs.splice(chromeTabIndex, 0, tabId);
+                    // Convert Chrome index to "non-app index"
+                    let nonAppIndex = 0;
+                    for (let i = 0; i < chromeTabIndex; i++) {
+                        if (!this.isAppTab(chromeWindow.tabs[i].url)) nonAppIndex++;
+                    }
+                    if (chromeTabIndex >= 0 && nonAppIndex < windowTabs.length) {
+                        windowTabs.splice(nonAppIndex, 0, tabId);
                     } else {
                         windowTabs.push(tabId);
                     }
@@ -779,6 +789,12 @@ class CaptureStore {
         
         const chromeTabIndex = chromeWindow.tabs.findIndex(t => t.id === tabPayload.chromeId);
         if (chromeTabIndex < 0) return;
+
+        // Convert Chrome index to "non-app index"
+        let nonAppIndex = 0;
+        for (let i = 0; i < chromeTabIndex; i++) {
+            if (!this.isAppTab(chromeWindow.tabs[i].url)) nonAppIndex++;
+        }
         
         // Remove tab from all windows and tab children arrays to prevent duplicates
         Object.values(this.items).forEach(item => {
@@ -796,17 +812,17 @@ class CaptureStore {
         const pl = this.items[windowId].data as BrowserWindowPayload;
         if (!pl.tabs.includes(tabId)) {
             // Insert at correct position based on Chrome tab index
-            if (chromeTabIndex < pl.tabs.length) {
-                pl.tabs.splice(chromeTabIndex, 0, tabId);
+            if (nonAppIndex < pl.tabs.length) {
+                pl.tabs.splice(nonAppIndex, 0, tabId);
             } else {
                 pl.tabs.push(tabId);
             }
         } else {
             // Move to correct position if already in array
             const currentIndex = pl.tabs.indexOf(tabId);
-            if (currentIndex !== chromeTabIndex && chromeTabIndex < pl.tabs.length) {
+            if (currentIndex !== nonAppIndex && nonAppIndex < pl.tabs.length) {
                 pl.tabs.splice(currentIndex, 1);
-                pl.tabs.splice(chromeTabIndex, 0, tabId);
+                pl.tabs.splice(nonAppIndex, 0, tabId);
             }
         }
     }
