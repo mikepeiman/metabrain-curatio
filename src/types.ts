@@ -1,5 +1,10 @@
 export type UUID = string;
 
+export type OutlineRow = {
+  id: UUID;
+  depth: number;
+};
+
 export interface BrowserTabPayload {
   url?: string;
   title?: string;
@@ -7,19 +12,19 @@ export interface BrowserTabPayload {
   isPinned?: boolean;
   chromeId?: number; // Chrome tab ID (undefined when ghost)
   isOpen?: boolean; // true when active in Chrome, false when ghost
-  /**
-   * Semantic nesting only: does NOT affect Chrome tab order.
-   * Points to the UUID of either a window or another tab.
-   */
-  outlineParentId?: UUID;
-  // Legacy (pre-refactor) nesting representation; migrated to outlineParentId.
-  children?: UUID[];
   status?: 'active' | 'closed' | 'archived'; // Item state: active (visible), closed (ghost), archived (hidden)
 }
 
 export interface BrowserWindowPayload {
   name?: string;
-  tabs: UUID[];
+  /**
+   * Canonical outliner model: flat order + depth.
+   * Order (rows[].id) mirrors Chrome tab order (LTR) for active tabs.
+   * Depth encodes nesting; contiguity defines parent/child.
+   */
+  rows: OutlineRow[];
+  // Legacy field retained for migration/back-compat (do not use as source of truth)
+  tabs?: UUID[];
   chromeId?: number; // Chrome window ID (undefined when ghost)
   isOpen?: boolean; // true when active in Chrome, false when ghost
   status?: 'active' | 'closed' | 'archived'; // Item state: active (visible), closed (ghost), archived (hidden)
